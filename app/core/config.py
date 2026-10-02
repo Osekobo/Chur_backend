@@ -77,6 +77,23 @@ class Settings(BaseSettings):
     MAX_PAGE_SIZE: int = 500
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def _force_async_driver(cls, value: object) -> object:
+        """Upgrade a driverless DSN to the async driver the app runs on.
+
+        Managed Postgres providers hand out ``postgresql://user:pass@host/db``
+        URLs, which SQLAlchemy would route through psycopg2 and break the async
+        engine on. Patching the driver here keeps such URLs usable as-is.
+        """
+        if not isinstance(value, str):
+            return value
+        if value.startswith("postgres://"):
+            return value.replace("postgres://", "postgresql+asyncpg://", 1)
+        if value.startswith("postgresql://"):
+            return value.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return value
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def _split_origins(cls, value: object) -> object:
