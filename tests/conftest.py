@@ -40,6 +40,7 @@ TEST_USER = {
     "password": "TestPass123",
 }
 
+
 @pytest.fixture(scope="session", autouse=True)
 def _schema() -> Iterator[None]:
     """Create the schema for the test database and drop it afterwards.
@@ -110,18 +111,76 @@ def auth_client(client: TestClient) -> Iterator[TestClient]:
     yield client
 
 
-PLAIN_USER = {
-    "email": "plain@example.com",
-    "full_name": "Plain User",
-    "password": "PlainPass123",
+def _register(client: TestClient, email: str, full_name: str) -> tuple[str, str]:
+    """Register an account; return its access token and id.
+
+    Shared by the role fixtures below. Self-registration cannot pick a role, so the
+    account lands as an accountant and each fixture then writes the role it stands
+    for straight to the database - the same ``UPDATE`` an operator runs in psql,
+    since no API route can promote an account that does not exist yet.
+    """
+    response = client.post(
+        f"{settings.API_V1_PREFIX}/auth/register",
+        json={"email": email, "full_name": full_name, "password": ROLE_PASSWORD},
+    )
+    assert response.status_code == 201, response.text
+    return (
+        str(response.json()["tokens"]["access_token"]),
+        str(response.json()["user"]["id"]),
+    )
+
+
+def _set_role(user_id: str, role: str) -> None:
+    engine = create_engine(settings.sync_database_url, future=True)
+    with Session(engine) as session:
+        session.execute(
+            text("UPDATE users SET role = :role WHERE id = :id"),
+            {"role": role, "id": user_id},
+        )
+        session.commit()
+    engine.dispose()
+
+
+ROLE_PASSWORD = "RolePass123"
+
+ACCOUNTANT_USER = {
+    "email": "accountant@example.com",
+    "full_name": "Church Accountant",
 }
+
+SECRETARY_USER = {
+    "email": "secretary@example.com",
+    "full_name": "Church Secretary",
+}
+
+
+@pytest.fixture()
+def accountant_client(client: TestClient, clean_users: None) -> Iterator[IdentityClient]:
+    """An identity holding the money role: can spend, transfer, decide approvals.
+
+    No ``UPDATE`` needed - self-registration already lands here.
+    """
+    token, _ = _register(client, **ACCOUNTANT_USER)
+    yield IdentityClient(client, token)
+
+
+@pytest.fixture()
+def secretary_client(client: TestClient, clean_users: None) -> Iterator[IdentityClient]:
+    """An identity holding the front-office role: directory and money in only.
+
+    The role is written directly because a secretary cannot manage accounts, so
+    there is no API route through which a test could grant it.
+    """
+    token, user_id = _register(client, **SECRETARY_USER)
+    _set_role(user_id, "secretary")
+    yield IdentityClient(client, token)
 
 
 class IdentityClient:
     """A ``TestClient`` view that authenticates as one fixed account.
 
-    A test needs to be two people at once - a plain user may raise a request, then
-    an administrator approves it. Two separate ``TestClient`` objects cannot
+    A test needs to be two people at once - a secretary may raise a request, then
+    an accountant approves it. Two separate ``TestClient`` objects cannot
     express that here: the app owns a single async engine and each ``TestClient``
     drives the app in its own event loop, so a pooled asyncpg connection opened in
     one loop is reused in the other and the suite dies with "got Future attached
@@ -167,38 +226,6 @@ class IdentityClient:
 
 
 @pytest.fixture()
-def plain_client(client: TestClient, clean_users: None) -> Iterator[IdentityClient]:
-    """A non-administrator identity, for tests that also act as an administrator.
-
-    ``auth_client`` and ``admin_client`` wrap the same ``client`` and share one
-    ``Authorization`` header, so the last one requested wins and a test cannot
-    hold both roles. This returns an :class:`IdentityClient` instead, so a
-    non-administrator and an administrator can act in the same test.
-
-    It depends on ``clean_users`` so the account is created *after* the
-    ``TRUNCATE users CASCADE`` that ``admin_client`` also triggers, whichever
-    order the parameters happen to be written in.
-    """
-    response = client.post(
-        f"{settings.API_V1_PREFIX}/auth/register",
-        json={
-            "email": PLAIN_USER["email"],
-            "full_name": PLAIN_USER["full_name"],
-            "password": PLAIN_USER["password"],
-        },
-    )
-    assert response.status_code == 201, response.text
-    yield IdentityClient(client, str(response.json()["tokens"]["access_token"]))
-
-
-ADMIN_USER = {
-    "email": "admin@example.com",
-    "full_name": "Test Administrator",
-    "password": "AdminPass123",
-}
-
-
-@pytest.fixture()
 def clean_users() -> Iterator[None]:
     """Drop every account before and after the test.
 
@@ -236,18 +263,16 @@ def admin_client(client: TestClient, clean_users: None) -> Iterator[TestClient]:
         },
     )
     assert register.status_code == 201, register.text
-    user_id = register.json()["user"]["id"]
-
-    engine = create_engine(settings.sync_database_url, future=True)
-    with Session(engine) as session:
-        session.execute(
-            text("UPDATE users SET is_superuser = true WHERE id = :id"),
-            {"id": str(user_id)},
-        )
-        session.commit()
-    engine.dispose()
+    _set_role(register.json()["user"]["id"], "admin")
 
     client.headers.update({"Authorization": f"Bearer {register.json()['tokens']['access_token']}"})
     assert client.get(f"{settings.API_V1_PREFIX}/users").status_code == 200
 
     yield client
+
+
+ADMIN_USER = {
+    "email": "admin@example.com",
+    "full_name": "Test Administrator",
+    "password": "AdminPass123",
+}

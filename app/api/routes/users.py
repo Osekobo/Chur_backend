@@ -1,7 +1,7 @@
 """Administrator-only user management.
 
-Every endpoint here is gated on :data:`app.core.deps.Superuser`, so a signed-in
-non-administrator gets 403 regardless of what they ask for.
+Every endpoint here is gated on :data:`Permission.USERS_MANAGE`, so a signed-in
+accountant or secretary gets 403 regardless of what they ask for.
 
 Three deliberate choices:
 
@@ -12,9 +12,9 @@ Three deliberate choices:
   ``is_active`` on every request, so an already-issued access token dies at once.
 * **An administrator cannot demote or deactivate themselves.** This single rule
   is what makes permanent lockout impossible, and it needs no counting argument:
-  reaching any endpoint here already proves the caller is an active
-  administrator (``Superuser`` chains ``get_current_user``, which rejects
-  inactive accounts, into ``get_current_active_superuser``). So the caller always
+  reaching any endpoint here already proves the caller is an active administrator
+  (``Permission.USERS_MANAGE`` is held only by that role, and the dependency chains
+  ``get_current_user``, which rejects inactive accounts). So the caller always
   remains one administrator, and any *other* account can safely be demoted or
   deactivated. Since ``scripts/seed.py`` is gone there is no CLI back door, so
   this refusal is the only thing standing between an operator and a system
@@ -27,14 +27,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import delete, select, update
 
-from app.core.deps import ClientIp, DbSession, Superuser
+from app.core.deps import ClientIp, DbSession
+from app.core.permissions import require_permission
 from app.core.security import hash_password
 from app.db.models import RefreshToken, User
-from app.enums import AuditAction, AuditEntity
+from app.enums import AuditAction, AuditEntity, Permission, UserRole
 from app.schemas.auth import (
     AdminUserCreate,
     SetPasswordRequest,
@@ -46,13 +48,15 @@ from app.services import audit
 
 router = APIRouter(prefix="/users", tags=["users"])
 
+AccountsAdmin = Annotated[User, Depends(require_permission(Permission.USERS_MANAGE))]
+
 
 def _normalise_email(email: str) -> str:
     return email.strip().lower()
 
 
 @router.get("", response_model=list[UserRead], summary="List user accounts")
-async def list_users(db: DbSession, _admin: Superuser) -> list[UserRead]:
+async def list_users(db: DbSession, _admin: AccountsAdmin) -> list[UserRead]:
     rows = (
         (await db.execute(select(User).order_by(User.full_name, User.email)))
         .scalars()
@@ -68,7 +72,7 @@ async def list_users(db: DbSession, _admin: Superuser) -> list[UserRead]:
     summary="Create a user account",
 )
 async def create_user(
-    payload: AdminUserCreate, db: DbSession, admin: Superuser, ip: ClientIp
+    payload: AdminUserCreate, db: DbSession, admin: AccountsAdmin, ip: ClientIp
 ) -> UserRead:
     """Provision an account with its role already assigned.
 
@@ -87,21 +91,20 @@ async def create_user(
         email=email,
         full_name=payload.full_name.strip(),
         hashed_password=hash_password(payload.password),
-        is_superuser=payload.is_superuser,
+        role=payload.role,
     )
     db.add(user)
-    role = "administrator" if payload.is_superuser else "user"
     await audit.record(
         db,
         action=AuditAction.CREATE,
         entity=AuditEntity.USER,
         entity_id=user.id,
-        summary=f"{admin.full_name} created the {role} account {user.email}",
+        summary=f"{admin.full_name} created the {user.role.label} account {user.email}",
         actor=admin,
         changes={
             "email": user.email,
             "full_name": user.full_name,
-            "is_superuser": user.is_superuser,
+            "role": user.role.value,
         },
         ip_address=ip,
     )
@@ -115,7 +118,7 @@ async def update_user(
     user_id: uuid.UUID,
     payload: UserUpdate,
     db: DbSession,
-    admin: Superuser,
+    admin: AccountsAdmin,
     ip: ClientIp,
 ) -> UserRead:
     user = await db.get(User, user_id)
@@ -123,16 +126,16 @@ async def update_user(
         raise HTTPException(status_code=404, detail="This account no longer exists.")
 
     # Read the affected fields *before* mutating, so the log records old -> new.
-    before = audit.snapshot(user, ("full_name", "email", "is_superuser", "is_active"))
+    before = audit.snapshot(user, ("full_name", "email", "role", "is_active"))
     requested = payload.model_dump(exclude_unset=True)
 
     # Reaching this point means the caller is an active administrator (see the
     # module docstring), so refusing to strip the caller's own access is enough to
     # guarantee at least one administrator always remains.
-    drops_privilege = (requested.get("is_superuser") is False and user.is_superuser) or (
-        requested.get("is_active") is False and user.is_active
-    )
-    if drops_privilege and user.id == admin.id:
+    if user.id == admin.id and (
+        ("role" in requested and requested["role"] != UserRole.ADMIN)
+        or requested.get("is_active") is False
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
@@ -153,12 +156,12 @@ async def update_user(
             )
         )
 
-    after = audit.snapshot(user, ("full_name", "email", "is_superuser", "is_active"))
+    after = audit.snapshot(user, ("full_name", "email", "role", "is_active"))
     changed = audit.diff(before, after)
     if changed:
         # A role flip and a deactivation are different events with different
         # weight, so they get their own action rather than a generic "update".
-        if "is_superuser" in changed:
+        if "role" in changed:
             action = AuditAction.ROLE_CHANGE
         elif changed.get("is_active") == [True, False]:
             action = AuditAction.ACCOUNT_DEACTIVATED
@@ -171,7 +174,10 @@ async def update_user(
             action=action,
             entity=AuditEntity.USER,
             entity_id=user.id,
-            summary=f"{admin.full_name} updated the account {user.email}",
+            summary=(
+                f"{admin.full_name} updated the account {user.email}"
+                + (f" to {user.role.label}" if "role" in changed else "")
+            ),
             actor=admin,
             changes=changed,
             ip_address=ip,
@@ -191,7 +197,7 @@ async def set_password(
     user_id: uuid.UUID,
     payload: SetPasswordRequest,
     db: DbSession,
-    admin: Superuser,
+    admin: AccountsAdmin,
     ip: ClientIp,
 ) -> Message:
     """Overwrite a password without knowing the old one.
@@ -230,7 +236,7 @@ async def set_password(
 async def revoke_sessions(
     user_id: uuid.UUID,
     db: DbSession,
-    admin: Superuser,
+    admin: AccountsAdmin,
     ip: ClientIp,
 ) -> Message:
     """Force a sign-out by revoking every refresh token for the account."""

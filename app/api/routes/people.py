@@ -1,29 +1,52 @@
-"""People directory endpoints."""
+"""People directory endpoints.
+
+Every signed-in account may read the directory - picking a giver on a money-in
+entry means looking people up - but only a secretary or an administrator may
+change it. The accountant can see who is who without being able to edit the roll.
+
+The one rule that reaches across fields is the email requirement: suppliers,
+employees and users must carry an address. Because it depends on the role as well
+as the address, a patch cannot be validated field by field; :func:`update_person`
+re-validates the *merged* record through ``PersonBase`` before saving, so flipping
+someone from Member to Supplier demands the address the Member row did not need.
+"""
 
 from __future__ import annotations
 
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.exceptions import RequestValidationError
+from pydantic import ValidationError
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 
-from app.core.deps import ClientIp, CurrentUser, DbSession
-from app.db.models import Person
-from app.enums import AuditAction, AuditEntity, PersonRole
+from app.core.deps import ClientIp, DbSession
+from app.core.permissions import require_permission
+from app.db.models import Person, User
+from app.enums import AuditAction, AuditEntity, Permission, PersonRole
 from app.schemas.common import Message
-from app.schemas.person import PersonCreate, PersonRead, PersonUpdate
+from app.schemas.person import PersonBase, PersonCreate, PersonRead, PersonUpdate
 from app.services import audit
 
 router = APIRouter(prefix="/people", tags=["people"])
+
+PeopleViewer = Annotated[User, Depends(require_permission(Permission.PEOPLE_VIEW))]
+PeopleManager = Annotated[User, Depends(require_permission(Permission.PEOPLE_MANAGE))]
+
+#: The fields the audit trail describes a directory change by.
+_SNAPSHOT_FIELDS = ("name", "phone", "email", "role")
 
 
 @router.get("", response_model=list[PersonRead], summary="List people")
 async def list_people(
     db: DbSession,
-    _user: CurrentUser,
+    _user: PeopleViewer,
     role: PersonRole | None = Query(default=None, description="Filter by directory role."),
-    search: str | None = Query(default=None, max_length=200, description="Name or phone contains."),
+    search: str | None = Query(
+        default=None, max_length=200, description="Name, phone or email contains."
+    ),
     limit: int = Query(default=500, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
 ) -> list[PersonRead]:
@@ -36,6 +59,7 @@ async def list_people(
             or_(
                 func.lower(Person.name).like(pattern),
                 func.lower(Person.phone).like(pattern),
+                func.lower(Person.email).like(pattern),
             )
         )
     statement = statement.order_by(Person.name).limit(limit).offset(offset)
@@ -44,7 +68,7 @@ async def list_people(
 
 
 @router.get("/count", response_model=dict[str, int], summary="Count people per role")
-async def count_people(db: DbSession, _user: CurrentUser) -> dict[str, int]:
+async def count_people(db: DbSession, _user: PeopleViewer) -> dict[str, int]:
     rows = (await db.execute(select(Person.role, func.count()).group_by(Person.role))).all()
     counts = {role.value: 0 for role in PersonRole}
     counts.update({role_value: int(count) for role_value, count in rows})
@@ -56,7 +80,7 @@ async def count_people(db: DbSession, _user: CurrentUser) -> dict[str, int]:
     "", response_model=PersonRead, status_code=status.HTTP_201_CREATED, summary="Add a person"
 )
 async def create_person(
-    payload: PersonCreate, db: DbSession, user: CurrentUser, ip: ClientIp
+    payload: PersonCreate, db: DbSession, user: PeopleManager, ip: ClientIp
 ) -> PersonRead:
     person = Person(**payload.model_dump())
     db.add(person)
@@ -67,7 +91,7 @@ async def create_person(
         entity_id=person.id,
         summary=f"{user.full_name} added {person.name} to the directory",
         actor=user,
-        changes=audit.snapshot(person, ("name", "phone", "email", "role")),
+        changes=audit.snapshot(person, _SNAPSHOT_FIELDS),
         ip_address=ip,
     )
     try:
@@ -84,19 +108,31 @@ async def update_person(
     person_id: uuid.UUID,
     payload: PersonUpdate,
     db: DbSession,
-    user: CurrentUser,
+    user: PeopleManager,
     ip: ClientIp,
 ) -> PersonRead:
     person = await db.get(Person, person_id)
     if person is None:
         raise HTTPException(status_code=404, detail="This person no longer exists.")
 
-    before = audit.snapshot(person, ("name", "phone", "email", "role"))
+    before = audit.snapshot(person, _SNAPSHOT_FIELDS)
     requested = payload.model_dump(exclude_unset=True)
+
+    # Re-validate the whole person, not just the fields in the patch: the rules
+    # that matter (an address for a supplier, a member category only for a member)
+    # depend on the record as it will be, not as it is. Raising the same error type
+    # as a rejected create means the message is formatted by the same handler, so a
+    # bad patch reads exactly like a bad form.
+    merged = {**before, **requested}
+    try:
+        PersonBase.model_validate(merged)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors()) from exc
+
     for field, value in requested.items():
         setattr(person, field, value)
 
-    changed = audit.diff(before, audit.snapshot(person, ("name", "phone", "email", "role")))
+    changed = audit.diff(before, audit.snapshot(person, _SNAPSHOT_FIELDS))
     if changed:
         await audit.record(
             db,
@@ -115,7 +151,7 @@ async def update_person(
 
 @router.delete("/{person_id}", response_model=Message, summary="Delete a person")
 async def delete_person(
-    person_id: uuid.UUID, db: DbSession, user: CurrentUser, ip: ClientIp
+    person_id: uuid.UUID, db: DbSession, user: PeopleManager, ip: ClientIp
 ) -> Message:
     person = await db.get(Person, person_id)
     if person is None:
@@ -128,7 +164,7 @@ async def delete_person(
         entity_id=person.id,
         summary=f"{user.full_name} deleted {name} from the directory",
         actor=user,
-        changes=audit.snapshot(person, ("name", "phone", "email", "role")),
+        changes=audit.snapshot(person, _SNAPSHOT_FIELDS),
         ip_address=ip,
     )
     await db.delete(person)

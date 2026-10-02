@@ -64,19 +64,6 @@ async def get_current_user(
 CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
-async def get_current_active_superuser(user: CurrentUser) -> User:
-    if not user.is_superuser:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="The user does not have enough privileges.",
-        )
-    return user
-
-
-#: Gate for the administrator-only endpoints.
-Superuser = Annotated[User, Depends(get_current_active_superuser)]
-
-
 async def revoke_refresh_token(db: AsyncSession, raw_token: str) -> None:
     """Mark a refresh token as revoked. Unknown tokens are ignored."""
     await db.execute(

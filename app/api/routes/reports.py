@@ -5,18 +5,20 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import CurrentUser, DbSession
-from app.db.models import Person, Transaction
+from app.core.permissions import require_permission
+from app.db.models import Person, Transaction, User
 from app.enums import (
     ACCOUNTS,
     EXPENSE_CATEGORIES,
     FUNDS,
     INCOME_CATEGORIES,
     TRANSFER_CATEGORY,
+    Permission,
     PersonRole,
     TransactionType,
 )
@@ -41,13 +43,22 @@ router = APIRouter(tags=["reporting"])
 
 RECENT_TRANSACTION_LIMIT = 8
 
+#: Three levels of reading, because they answer different questions. The
+#: dashboard is a glance anyone may have; the giving reports and the double-entry
+#: statements are the accountant's working figures. A secretary reads the first
+#: two but not the statements - there is nothing in them about collections she
+#: could act on.
+DashboardViewer = Annotated[User, Depends(require_permission(Permission.DASHBOARD_VIEW))]
+ReportReader = Annotated[User, Depends(require_permission(Permission.REPORTS_VIEW))]
+AccountingReader = Annotated[User, Depends(require_permission(Permission.ACCOUNTING_VIEW))]
+
 
 async def _all_transactions(db: AsyncSession) -> list[Transaction]:
     return list((await db.execute(select(Transaction))).scalars().all())
 
 
 @router.get("/dashboard", response_model=DashboardSummary, summary="Dashboard KPIs")
-async def dashboard(db: DbSession, _user: CurrentUser) -> DashboardSummary:
+async def dashboard(db: DbSession, _user: DashboardViewer) -> DashboardSummary:
     transactions = await _all_transactions(db)
     income = accounting.income_total(transactions)
     expenses = accounting.expense_total(transactions)
@@ -90,7 +101,7 @@ async def dashboard(db: DbSession, _user: CurrentUser) -> DashboardSummary:
 
 
 @router.get("/reports/summary", response_model=SummaryReport, summary="All-time category totals")
-async def summary_report(db: DbSession, _user: CurrentUser) -> SummaryReport:
+async def summary_report(db: DbSession, _user: ReportReader) -> SummaryReport:
     transactions = await _all_transactions(db)
     income = accounting.income_total(transactions)
     expenses = accounting.expense_total(transactions)
@@ -113,7 +124,7 @@ async def summary_report(db: DbSession, _user: CurrentUser) -> SummaryReport:
     response_model=list[str],
     summary="Names that can be searched in contribution history",
 )
-async def contribution_names(db: DbSession, _user: CurrentUser) -> list[str]:
+async def contribution_names(db: DbSession, _user: ReportReader) -> list[str]:
     rows = (
         (
             await db.execute(
@@ -140,7 +151,7 @@ async def contribution_names(db: DbSession, _user: CurrentUser) -> list[str]:
 )
 async def search_contributions(
     db: DbSession,
-    _user: CurrentUser,
+    _user: ReportReader,
     search: Annotated[str, Query(min_length=1, max_length=200)],
 ) -> ContributionSearchResult:
     """Every Money In entry recorded under a name containing ``search``.
@@ -183,7 +194,7 @@ async def search_contributions(
 )
 async def member_contributions(
     db: DbSession,
-    _user: CurrentUser,
+    _user: ReportReader,
     name: Annotated[str, Query(min_length=1, max_length=200)],
 ) -> list[MemberContribution]:
     """Full history for an exact contributor name, grouped per person.
@@ -232,7 +243,7 @@ async def member_contributions(
 @router.get("/accounting/ledger", response_model=list[TransactionRead], summary="General ledger")
 async def general_ledger(
     db: DbSession,
-    _user: CurrentUser,
+    _user: AccountingReader,
     include_transfers: bool = True,
 ) -> list[TransactionRead]:
     statement = select(Transaction)
@@ -251,7 +262,7 @@ async def general_ledger(
     response_model=ChartOfAccounts,
     summary="Chart of accounts with balances",
 )
-async def chart_of_accounts(db: DbSession, _user: CurrentUser) -> ChartOfAccounts:
+async def chart_of_accounts(db: DbSession, _user: AccountingReader) -> ChartOfAccounts:
     transactions = await _all_transactions(db)
     accounts, total_debits, total_credits = accounting.trial_balance(transactions)
     return ChartOfAccounts(
@@ -267,7 +278,7 @@ async def chart_of_accounts(db: DbSession, _user: CurrentUser) -> ChartOfAccount
     response_model=TrialBalance,
     summary="Trial balance",
 )
-async def trial_balance(db: DbSession, _user: CurrentUser) -> TrialBalance:
+async def trial_balance(db: DbSession, _user: AccountingReader) -> TrialBalance:
     transactions = await _all_transactions(db)
     accounts, total_debits, total_credits = accounting.trial_balance(transactions)
     return TrialBalance(
@@ -284,7 +295,7 @@ async def trial_balance(db: DbSession, _user: CurrentUser) -> TrialBalance:
     response_model=FinancialStatements,
     summary="Income statement and balance sheet position",
 )
-async def financial_statements(db: DbSession, _user: CurrentUser) -> FinancialStatements:
+async def financial_statements(db: DbSession, _user: AccountingReader) -> FinancialStatements:
     transactions = await _all_transactions(db)
     lines = accounting.journal_lines(transactions)
 

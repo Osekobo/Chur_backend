@@ -26,7 +26,7 @@ from app.core.security import (
     verify_password,
 )
 from app.db.models import PasswordResetToken, RefreshToken, User
-from app.enums import AuditAction, AuditEntity
+from app.enums import AuditAction, AuditEntity, UserRole
 from app.schemas.auth import (
     AuthSession,
     ChangePasswordRequest,
@@ -93,6 +93,11 @@ async def register(payload: UserCreate, db: DbSession, ip: ClientIp) -> AuthSess
         email=email,
         full_name=payload.full_name.strip(),
         hashed_password=hash_password(payload.password),
+        # Self-registration cannot pick a role, so it lands on the least
+        # privileged one and an administrator promotes it afterwards. Open
+        # registration is usually off (ALLOW_PUBLIC_REGISTRATION), and when it is
+        # on this default is what stops a stranger minting themselves an admin.
+        role=UserRole.ACCOUNTANT,
     )
     db.add(user)
     await audit.record(
@@ -102,7 +107,7 @@ async def register(payload: UserCreate, db: DbSession, ip: ClientIp) -> AuthSess
         entity_id=user.id,
         summary=f"{user.full_name} registered an account",
         actor=user,
-        changes={"email": user.email, "is_superuser": user.is_superuser},
+        changes={"email": user.email, "role": user.role.value},
         ip_address=ip,
     )
     await db.commit()

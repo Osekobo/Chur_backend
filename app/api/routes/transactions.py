@@ -5,13 +5,15 @@ from __future__ import annotations
 import uuid
 from datetime import date
 from decimal import Decimal
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import ColumnElement, case, delete, func, or_, select
 
 from app.core.config import settings
 from app.core.deps import ClientIp, CurrentUser, DbSession
-from app.db.models import Transaction
+from app.core.permissions import ensure_permission, require_permission
+from app.db.models import Transaction, User
 from app.enums import (
     ACCOUNTS,
     FUNDS,
@@ -20,6 +22,7 @@ from app.enums import (
     AuditAction,
     AuditEntity,
     Fund,
+    Permission,
     TransactionType,
 )
 from app.schemas.common import Message
@@ -163,7 +166,10 @@ async def list_transfers(db: DbSession, _user: CurrentUser) -> list[TransferRead
     summary="Move money between accounts",
 )
 async def create_transfer(
-    payload: TransferCreate, db: DbSession, user: CurrentUser, ip: ClientIp
+    payload: TransferCreate,
+    db: DbSession,
+    user: Annotated[User, Depends(require_permission(Permission.TRANSFERS_MANAGE))],
+    ip: ClientIp,
 ) -> TransferRead:
     """Create both legs of a transfer atomically."""
     transfer_id = uuid.uuid4()
@@ -271,6 +277,19 @@ async def list_transactions(
 async def create_transaction(
     payload: TransactionCreate, db: DbSession, user: CurrentUser, ip: ClientIp
 ) -> TransactionRead:
+    """Record one entry, in whichever direction the role is allowed to work.
+
+    A single endpoint serves both halves of the ledger, so the check has to wait
+    for the payload: a secretary may raise income but not spending. Refusing here,
+    after the direction is known, is the only way to express that without two
+    near-duplicate endpoints that would drift apart.
+    """
+    ensure_permission(
+        user,
+        Permission.MONEY_IN
+        if payload.type is TransactionType.INCOME
+        else Permission.MONEY_OUT,
+    )
     transaction = Transaction(**payload.model_dump(), created_by_id=user.id)
     db.add(transaction)
     verb = "recorded" if payload.type is TransactionType.INCOME else "spent"
@@ -304,6 +323,20 @@ async def delete_transaction(
     transaction = await db.get(Transaction, transaction_id)
     if transaction is None:
         raise HTTPException(status_code=404, detail="This entry no longer exists.")
+
+    # Deleting rewrites a balance, so it needs the same permission as recording
+    # that direction in the first place - measured on the row being removed, not
+    # on the caller's intent. A transfer also takes the stronger permission: both
+    # of its legs are about moving money that is already banked.
+    is_transfer = transaction.transfer_id is not None
+    required = (
+        Permission.TRANSFERS_MANAGE
+        if is_transfer
+        else Permission.MONEY_IN
+        if transaction.type is TransactionType.INCOME
+        else Permission.MONEY_OUT
+    )
+    ensure_permission(user, required)
 
     transfer_id = transaction.transfer_id
     # Captured before the row goes away - the log has to describe what was removed.

@@ -1,9 +1,9 @@
 """Money-out approval workflow.
 
 A request is raised by whoever spots the expense, sits as ``pending`` while it is
-discussed, and only becomes part of the ledger when an administrator approves it.
+discussed, and only becomes part of the ledger when a money role approves it.
 
-Two properties are worth stating because they are what makes the workflow
+Three properties are worth stating because they are what makes the workflow
 trustworthy:
 
 * **A pending request moves nothing.** No balance, report, trial balance or
@@ -13,19 +13,24 @@ trustworthy:
   ``status == pending``, so a double-click or a retried request cannot create two
   expenses. The approval and the transaction it creates are written in a single
   commit.
+* **Raising and deciding are separate permissions.** A secretary can notice a bill
+  and put it in the queue without being able to authorise the spending; only the
+  accountant (or an administrator) can turn a request into a ledger entry.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 
-from app.core.deps import ClientIp, CurrentUser, DbSession, Superuser
-from app.db.models import ApprovalRequest, Transaction
-from app.enums import ApprovalStatus, AuditAction, AuditEntity, TransactionType
+from app.core.deps import ClientIp, DbSession
+from app.core.permissions import require_permission
+from app.db.models import ApprovalRequest, Transaction, User
+from app.enums import ApprovalStatus, AuditAction, AuditEntity, Permission, TransactionType
 from app.schemas.approval import (
     ApprovalCreate,
     ApprovalDecision,
@@ -38,11 +43,14 @@ from app.services.realtime import change_event, manager
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 
+ApprovalsReader = Annotated[User, Depends(require_permission(Permission.APPROVALS_VIEW))]
+ApprovalsDecider = Annotated[User, Depends(require_permission(Permission.APPROVALS_DECIDE))]
+
 
 @router.get("", response_model=list[ApprovalRead], summary="List approval requests")
 async def list_approvals(
     db: DbSession,
-    _user: CurrentUser,
+    _user: ApprovalsReader,
     request_status: ApprovalStatus | None = Query(default=None, alias="status"),
     mine: bool = Query(default=False, description="Only requests raised by the caller."),
     limit: int = Query(default=200, ge=1, le=1000),
@@ -67,7 +75,7 @@ async def list_approvals(
 
 
 @router.get("/count", response_model=ApprovalSummary, summary="Count requests by status")
-async def count_approvals(db: DbSession, _user: CurrentUser) -> ApprovalSummary:
+async def count_approvals(db: DbSession, _user: ApprovalsReader) -> ApprovalSummary:
     rows = (
         await db.execute(
             select(ApprovalRequest.status, func.count()).group_by(ApprovalRequest.status)
@@ -92,7 +100,7 @@ async def count_approvals(db: DbSession, _user: CurrentUser) -> ApprovalSummary:
 async def create_approval(
     payload: ApprovalCreate,
     db: DbSession,
-    user: CurrentUser,
+    user: Annotated[User, Depends(require_permission(Permission.APPROVALS_REQUEST))],
     ip: ClientIp,
 ) -> ApprovalRead:
     request = ApprovalRequest(
@@ -145,7 +153,7 @@ async def approve_request(
     approval_id: uuid.UUID,
     payload: ApprovalDecision,
     db: DbSession,
-    admin: Superuser,
+    decider: ApprovalsDecider,
     ip: ClientIp,
 ) -> ApprovalRead:
     """Approve, then write the matching expense into the ledger.
@@ -166,12 +174,12 @@ async def approve_request(
         notes=request.notes,
         date=request.date,
     )
-    transaction = Transaction(**transaction_input.model_dump(), created_by_id=admin.id)
+    transaction = Transaction(**transaction_input.model_dump(), created_by_id=decider.id)
     db.add(transaction)
     await db.flush()  # assign the id before linking the request to it
 
     request.status = ApprovalStatus.APPROVED
-    request.decided_by_id = admin.id
+    request.decided_by_id = decider.id
     request.decided_at = datetime.now(UTC)
     request.decision_note = payload.note
     request.transaction_id = transaction.id
@@ -182,10 +190,10 @@ async def approve_request(
         entity=AuditEntity.APPROVAL,
         entity_id=request.id,
         summary=(
-            f"{admin.full_name} approved {request.amount} for {request.category}"
+            f"{decider.full_name} approved {request.amount} for {request.category}"
             f" and recorded it in the ledger"
         ),
-        actor=admin,
+        actor=decider,
         changes={"status": [ApprovalStatus.PENDING.value, ApprovalStatus.APPROVED.value]},
         ip_address=ip,
     )
@@ -195,10 +203,10 @@ async def approve_request(
         entity=AuditEntity.TRANSACTION,
         entity_id=transaction.id,
         summary=(
-            f"{request.amount} {request.category} recorded by {admin.full_name}"
+            f"{request.amount} {request.category} recorded by {decider.full_name}"
             f" from an approved request"
         ),
-        actor=admin,
+        actor=decider,
         changes=audit.snapshot(
             transaction, ("type", "category", "party", "amount", "fund", "account", "date")
         ),
@@ -228,14 +236,14 @@ async def reject_request(
     approval_id: uuid.UUID,
     payload: ApprovalDecision,
     db: DbSession,
-    admin: Superuser,
+    decider: ApprovalsDecider,
     ip: ClientIp,
 ) -> ApprovalRead:
     """Reject without touching the ledger."""
     request = await _get_pending(db, approval_id)
 
     request.status = ApprovalStatus.REJECTED
-    request.decided_by_id = admin.id
+    request.decided_by_id = decider.id
     request.decided_at = datetime.now(UTC)
     request.decision_note = payload.note
 
@@ -244,8 +252,8 @@ async def reject_request(
         action=AuditAction.REJECT,
         entity=AuditEntity.APPROVAL,
         entity_id=request.id,
-        summary=f"{admin.full_name} rejected the {request.amount} {request.category} request",
-        actor=admin,
+        summary=f"{decider.full_name} rejected the {request.amount} {request.category} request",
+        actor=decider,
         changes={"status": [ApprovalStatus.PENDING.value, ApprovalStatus.REJECTED.value]},
         ip_address=ip,
     )

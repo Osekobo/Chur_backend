@@ -33,6 +33,7 @@ from app.enums import (
     Fund,
     PersonRole,
     TransactionType,
+    UserRole,
 )
 
 
@@ -60,8 +61,10 @@ class User(Base, TimestampMixin):
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=text("true"), nullable=False
     )
-    is_superuser: Mapped[bool] = mapped_column(
-        Boolean, default=False, server_default=text("false"), nullable=False
+    #: What this account is for. Authorisation reads this, never a flag on the
+    #: row, so there is exactly one place that decides what a role may do.
+    role: Mapped[UserRole] = enum_column(
+        UserRole, "user_role", server_default=text(f"'{UserRole.ACCOUNTANT}'")
     )
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -120,7 +123,7 @@ class PasswordResetToken(Base):
 
 
 class Person(Base, TimestampMixin):
-    """A member, supplier, employee or system user tracked in the directory."""
+    """A member, guest, supplier, employee or system user in the directory."""
 
     __tablename__ = "people"
     __table_args__ = (
@@ -132,6 +135,9 @@ class Person(Base, TimestampMixin):
     role: Mapped[PersonRole] = enum_column(PersonRole, "person_role")
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     phone: Mapped[str] = mapped_column(String(40), default="", server_default="")
+    #: Optional for members and guests, mandatory for suppliers, employees and
+    #: users - see EMAIL_REQUIRED_ROLES.
+    email: Mapped[str] = mapped_column(String(320), default="", server_default="")
     category: Mapped[str] = mapped_column(String(60), default="", server_default="")
     notes: Mapped[str] = mapped_column(Text, default="", server_default="")
 

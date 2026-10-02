@@ -9,7 +9,7 @@ from app.enums import TITHE_SCOPE_ALL, TRANSFER_CATEGORY, Account
 from app.schemas.transaction import PctDeductionCreate
 from fastapi.testclient import TestClient
 
-from tests.conftest import TEST_USER
+from tests.conftest import TEST_USER, IdentityClient
 
 API = "/api/v1"
 
@@ -167,12 +167,12 @@ class TestUserAdministration:
                 "email": "clerk@example.com",
                 "full_name": "Church Clerk",
                 "password": "StrongPass123",
-                "is_superuser": True,
+                "role": "admin",
             },
         )
         assert response.status_code == 201, response.text
         body = response.json()
-        assert body["role"] == "Administrator"
+        assert body["role"] == "admin"
         assert body["is_active"] is True
         # The password hash must never leave the server.
         assert "hashed_password" not in body
@@ -188,7 +188,7 @@ class TestUserAdministration:
                 "email": email,
                 "full_name": "New Clerk",
                 "password": "StrongPass123",
-                "is_superuser": False,
+                "role": "secretary",
             },
         )
         # No tokens are issued, so the administrator has to hand the password over.
@@ -196,7 +196,7 @@ class TestUserAdministration:
             f"{API}/auth/login", json={"email": email, "password": "StrongPass123"}
         )
         assert login.status_code == 200
-        assert login.json()["user"]["role"] == "User"
+        assert login.json()["user"]["role"] == "secretary"
 
     def test_duplicate_email_is_rejected(self, admin_client: TestClient) -> None:
         payload = {
@@ -207,25 +207,53 @@ class TestUserAdministration:
         assert admin_client.post(f"{API}/users", json=payload).status_code == 201
         assert admin_client.post(f"{API}/users", json=payload).status_code == 409
 
-    def test_role_label_reflects_the_flags(self, admin_client: TestClient) -> None:
+    def test_role_label_reflects_the_account(self, admin_client: TestClient) -> None:
+        """The label is derived from the stored role, and inactive wins over it."""
         users = admin_client.get(f"{API}/users").json()
         roles = {user["email"]: user["role"] for user in users}
-        assert roles["admin@example.com"] == "Administrator"
+        assert roles["admin@example.com"] == "admin"
 
         created = admin_client.post(
             f"{API}/users",
             json={
-                "email": "plain@example.com",
-                "full_name": "Plain",
+                "email": "clerk@example.com",
+                "full_name": "Clerk",
                 "password": "StrongPass123",
+                "role": "secretary",
             },
         ).json()
-        assert created["role"] == "User"
+        assert created["role"] == "secretary"
+        assert created["role_label"] == "Secretary"
+
+        # No role chosen means the least privileged one, never admin.
+        defaulted = admin_client.post(
+            f"{API}/users",
+            json={"email": unique_email(), "full_name": "Default", "password": "StrongPass123"},
+        ).json()
+        assert defaulted["role"] == "accountant"
 
         deactivated = admin_client.patch(
             f"{API}/users/{created['id']}", json={"is_active": False}
         ).json()
-        assert deactivated["role"] == "Deactivated"
+        assert deactivated["role_label"] == "Deactivated"
+        # The stored role survives deactivation, so reactivating restores it.
+        assert deactivated["role"] == "secretary"
+
+    def test_each_role_reports_its_own_permissions(self, admin_client: TestClient) -> None:
+        """The client is told what to hide; the server still checks everything."""
+        created = admin_client.post(
+            f"{API}/users",
+            json={
+                "email": "auditor@example.com",
+                "full_name": "Auditor",
+                "password": "StrongPass123",
+                "role": "accountant",
+            },
+        ).json()
+        assert "money:out" in created["permissions"]
+        assert "approvals:decide" in created["permissions"]
+        assert "users:manage" not in created["permissions"]
+        assert "audit:view" not in created["permissions"]
 
     def test_deactivated_user_is_locked_out_immediately(self, admin_client: TestClient) -> None:
         email = unique_email()
@@ -268,7 +296,7 @@ class TestUserAdministration:
         always remains.
         """
         me = admin_client.get(f"{API}/auth/me").json()
-        response = admin_client.patch(f"{API}/users/{me['id']}", json={"is_superuser": False})
+        response = admin_client.patch(f"{API}/users/{me['id']}", json={"role": "secretary"})
         assert response.status_code == 400
         assert "your own" in response.json()["detail"].lower()
 
@@ -289,16 +317,14 @@ class TestUserAdministration:
                 "email": "second@example.com",
                 "full_name": "Second Admin",
                 "password": "StrongPass123",
-                "is_superuser": True,
+                "role": "admin",
             },
         ).json()
-        assert second["role"] == "Administrator"
+        assert second["role"] == "admin"
 
-        demoted = admin_client.patch(
-            f"{API}/users/{second['id']}", json={"is_superuser": False}
-        )
+        demoted = admin_client.patch(f"{API}/users/{second['id']}", json={"role": "secretary"})
         assert demoted.status_code == 200
-        assert demoted.json()["role"] == "User"
+        assert demoted.json()["role"] == "secretary"
 
     def test_administrator_may_deactivate_another_administrator(
         self, admin_client: TestClient
@@ -309,7 +335,7 @@ class TestUserAdministration:
                 "email": "second@example.com",
                 "full_name": "Second Admin",
                 "password": "StrongPass123",
-                "is_superuser": True,
+                "role": "admin",
             },
         ).json()
         assert (
@@ -326,7 +352,7 @@ class TestUserAdministration:
                 "email": email,
                 "full_name": "Second Admin",
                 "password": "StrongPass123",
-                "is_superuser": True,
+                "role": "admin",
             },
         ).json()
 
@@ -348,7 +374,7 @@ class TestUserAdministration:
 
         assert (
             admin_client.patch(
-                f"{API}/users/{second['id']}", json={"is_superuser": False}
+                f"{API}/users/{second['id']}", json={"role": "secretary"}
             ).status_code
             == 200
         )
@@ -476,17 +502,16 @@ class TestUserAdministration:
     def test_unknown_user_id_is_a_404(self, admin_client: TestClient) -> None:
         missing = "00000000-0000-0000-0000-000000000000"
         assert (
-            admin_client.patch(
-                f"{API}/users/{missing}", json={"is_active": False}
+            admin_client.patch(f"{API}/users/{missing}", json={"is_active": False}).status_code
+            == 404
+        )
+        assert admin_client.post(f"{API}/users/{missing}/sessions").status_code == 404
+        assert (
+            admin_client.post(
+                f"{API}/users/{missing}/password", json={"new_password": "StrongPass123"}
             ).status_code
             == 404
         )
-        assert (
-            admin_client.post(f"{API}/users/{missing}/sessions").status_code == 404
-        )
-        assert admin_client.post(
-            f"{API}/users/{missing}/password", json={"new_password": "StrongPass123"}
-        ).status_code == 404
 
 
 class TestTransactions:
@@ -621,8 +646,8 @@ class TestTransactions:
 
 
 class TestPeople:
-    def test_crud_cycle(self, auth_client: TestClient) -> None:
-        created = auth_client.post(
+    def test_crud_cycle(self, secretary_client: IdentityClient) -> None:
+        created = secretary_client.post(
             f"{API}/people",
             json={
                 "role": "Member",
@@ -635,36 +660,39 @@ class TestPeople:
         assert created.json()["name"] == "Grace Wanjiru"
 
         person_id = created.json()["id"]
-        updated = auth_client.patch(
+        updated = secretary_client.patch(
             f"{API}/people/{person_id}", json={"phone": "+254711111111", "notes": "Baptised"}
         )
         assert updated.status_code == 200
         assert updated.json()["phone"] == "+254711111111"
 
-        filtered = auth_client.get(f"{API}/people", params={"role": "Member"}).json()
+        filtered = secretary_client.get(f"{API}/people", params={"role": "Member"}).json()
         assert any(p["id"] == person_id for p in filtered)
 
-        searched = auth_client.get(f"{API}/people", params={"search": "wanjiru"}).json()
+        searched = secretary_client.get(f"{API}/people", params={"search": "wanjiru"}).json()
         assert any(p["id"] == person_id for p in searched)
 
-        counts = auth_client.get(f"{API}/people/count").json()
+        counts = secretary_client.get(f"{API}/people/count").json()
         assert counts["Member"] >= 1
         assert counts["total"] >= 1
 
-        assert auth_client.delete(f"{API}/people/{person_id}").status_code == 200
+        assert secretary_client.delete(f"{API}/people/{person_id}").status_code == 200
         assert (
-            auth_client.patch(f"{API}/people/{person_id}", json={"phone": "x"}).status_code == 404
+            secretary_client.patch(f"{API}/people/{person_id}", json={"phone": "x"}).status_code
+            == 404
         )
 
-    def test_member_category_is_validated(self, auth_client: TestClient) -> None:
-        response = auth_client.post(
+    def test_member_category_is_validated(self, secretary_client: IdentityClient) -> None:
+        response = secretary_client.post(
             f"{API}/people", json={"role": "Member", "name": "Bad Category", "category": "Aliens"}
         )
         assert response.status_code == 422
 
-    def test_unknown_role_is_rejected(self, auth_client: TestClient) -> None:
+    def test_unknown_role_is_rejected(self, secretary_client: IdentityClient) -> None:
         assert (
-            auth_client.post(f"{API}/people", json={"role": "Bishop", "name": "Nope"}).status_code
+            secretary_client.post(
+                f"{API}/people", json={"role": "Bishop", "name": "Nope"}
+            ).status_code
             == 422
         )
 
@@ -755,7 +783,13 @@ class TestReporting:
         assert reference["accounts"] == ["Cash", "Bank", "M-PESA"]
         assert reference["transfer_category"] == "Transfer"
         assert "Tithes" in reference["income_categories"]
-        assert reference["person_roles"] == ["Member", "Supplier", "Employee", "User"]
+        assert reference["person_roles"] == [
+            "Member",
+            "Guest",
+            "Supplier",
+            "Employee",
+            "User",
+        ]
 
     def test_summary_report(self, auth_client: TestClient) -> None:
         report = auth_client.get(f"{API}/reports/summary").json()
@@ -1169,9 +1203,10 @@ class TestPercentageDeduction:
             account=TITHE_SCOPE_ALL,
         )
         assert payload.account == "all"
-        assert PctDeductionCreate(
-            date=date(2026, 3, 8), pct=Decimal("10"), account="Cash"
-        ).account is Account.CASH
+        assert (
+            PctDeductionCreate(date=date(2026, 3, 8), pct=Decimal("10"), account="Cash").account
+            is Account.CASH
+        )
 
 
 class TestContributionSearch:
@@ -1306,8 +1341,7 @@ class TestFundSummary:
             },
         )
         rows = {
-            row["fund"]: row
-            for row in auth_client.get(f"{API}/transactions/funds/summary").json()
+            row["fund"]: row for row in auth_client.get(f"{API}/transactions/funds/summary").json()
         }
         for row in rows.values():
             assert Decimal(row["net"]) == Decimal("0.00"), row

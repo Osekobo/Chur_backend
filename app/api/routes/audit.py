@@ -13,17 +13,21 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, time
+from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, or_, select
 
-from app.core.deps import DbSession, Superuser
-from app.db.models import AuditEntry
-from app.enums import AuditAction, AuditEntity
+from app.core.deps import DbSession
+from app.core.permissions import require_permission
+from app.db.models import AuditEntry, User
+from app.enums import AuditAction, AuditEntity, Permission
 from app.schemas.audit import AuditEntryRead
 from app.schemas.common import Page
 
 router = APIRouter(prefix="/audit", tags=["audit"])
+
+AuditReader = Annotated[User, Depends(require_permission(Permission.AUDIT_VIEW))]
 
 
 @router.get(
@@ -33,7 +37,7 @@ router = APIRouter(prefix="/audit", tags=["audit"])
 )
 async def list_audit_entries(
     db: DbSession,
-    _admin: Superuser,
+    _admin: AuditReader,
     action: AuditAction | None = None,
     entity: AuditEntity | None = None,
     actor_id: uuid.UUID | None = Query(default=None, description="Filter to one user."),

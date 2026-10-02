@@ -16,13 +16,14 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
-from typing import Literal, TypeGuard, cast
+from typing import Annotated, Literal, TypeGuard, cast
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 
-from app.core.deps import ClientIp, CurrentUser, DbSession
-from app.db.models import Transaction
+from app.core.deps import ClientIp, DbSession
+from app.core.permissions import require_permission
+from app.db.models import Transaction, User
 from app.enums import (
     FUND_DEDUCTION,
     PCT_DEDUCTION_CATEGORY,
@@ -31,7 +32,8 @@ from app.enums import (
     Account,
     AuditAction,
     AuditEntity,
-    IncomeCategory,
+IncomeCategory,
+    Permission,
     TitheScope,
     TransactionType,
 )
@@ -47,6 +49,10 @@ from app.services import accounting, audit
 from app.services.realtime import change_event, manager
 
 router = APIRouter(tags=["deductions"])
+
+#: Splitting income across funds rewrites the ledger, so it belongs to the money
+#: roles rather than to whoever can read it.
+DeductionUser = Annotated[User, Depends(require_permission(Permission.DEDUCTIONS_MANAGE))]
 
 #: Stored as the party on a deduction entry that has no purpose typed in.
 DEFAULT_DEDUCTION_PARTY = "Percentage Deduction"
@@ -130,7 +136,7 @@ def _nothing_to_deduct(day: date, account: TitheScope) -> str:
 )
 async def tithes_on_date(
     db: DbSession,
-    _user: CurrentUser,
+    _user: DeductionUser,
     day: date = Query(alias="date"),
 ) -> TithesOnDate:
     """The base a percentage deduction is calculated from."""
@@ -144,7 +150,7 @@ async def tithes_on_date(
 )
 async def preview_pct_deduction(
     db: DbSession,
-    _user: CurrentUser,
+    _user: DeductionUser,
     day: date = Query(alias="date"),
     pct: Decimal = Query(ge=0, le=100),
     account: TitheScope = Account.CASH,
@@ -174,7 +180,7 @@ async def preview_pct_deduction(
     response_model=list[TransactionRead],
     summary="Percentage deductions recorded so far",
 )
-async def list_pct_deductions(db: DbSession, _user: CurrentUser) -> list[TransactionRead]:
+async def list_pct_deductions(db: DbSession, _user: DeductionUser) -> list[TransactionRead]:
     """History for the Tithe % Deduction page, newest first."""
     rows = (
         (
@@ -197,7 +203,7 @@ async def list_pct_deductions(db: DbSession, _user: CurrentUser) -> list[Transac
     summary="Deduct a percentage of a Sunday's tithes",
 )
 async def create_pct_deduction(
-    payload: PctDeductionCreate, db: DbSession, user: CurrentUser, ip: ClientIp
+    payload: PctDeductionCreate, db: DbSession, user: DeductionUser, ip: ClientIp
 ) -> PctDeductionResult:
     """Record the deduction as an expense against the account it came from.
 

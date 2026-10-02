@@ -8,6 +8,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, EmailStr, Field, computed_field, field_validator
 
+from app.core.permissions import permissions_for
+from app.enums import UserRole
 from app.schemas.common import ORMModel, TokenPair
 
 PASSWORD_MIN_LENGTH = 8
@@ -57,21 +59,31 @@ class UserRead(ORMModel):
     email: EmailStr
     full_name: str
     is_active: bool
-    is_superuser: bool
+    role: UserRole
     last_login_at: datetime | None = None
     created_at: datetime
 
     @computed_field  # type: ignore[prop-decorator]
     @property
-    def role(self) -> str:
-        """Display label for the two stored flags.
+    def role_label(self) -> str:
+        """Capitalised name for the interface.
 
-        Derived rather than stored so the database stays the single source of
-        truth for the role and the client never has to interpret the flags.
+        Derived rather than stored so the database stays the single source of truth
+        and the client never has to format the value itself.
         """
         if not self.is_active:
             return "Deactivated"
-        return "Administrator" if self.is_superuser else "User"
+        return self.role.label
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def permissions(self) -> list[str]:
+        """What this account may do, so the interface can hide the rest.
+
+        The server checks every one of these again on each request; the list only
+        spares the user from being offered a page that would refuse them.
+        """
+        return sorted(permission.value for permission in permissions_for(self.role))
 
 
 class AuthSession(BaseModel):
@@ -118,11 +130,12 @@ class AdminUserCreate(UserCreate):
     """An administrator provisions this account, so the role is chosen up front.
 
     Reuses ``UserCreate`` so the password rules and name trimming stay identical
-    to public registration - the only difference is that ``is_superuser`` is
-    settable here.
+    to public registration - the only difference is that the role is settable here.
+    The default is the least privileged money role, so forgetting to choose one
+    cannot hand out account management by accident.
     """
 
-    is_superuser: bool = False
+    role: UserRole = UserRole.ACCOUNTANT
 
 
 class UserUpdate(BaseModel):
@@ -130,7 +143,7 @@ class UserUpdate(BaseModel):
 
     full_name: str | None = Field(default=None, min_length=1, max_length=200)
     is_active: bool | None = None
-    is_superuser: bool | None = None
+    role: UserRole | None = None
 
     @field_validator("full_name")
     @classmethod

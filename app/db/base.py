@@ -11,6 +11,7 @@ from sqlalchemy import DateTime, MetaData, func
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.sql.elements import TextClause
 
 # Explicit naming convention so Alembic can autogenerate reversible migrations.
 NAMING_CONVENTION = {
@@ -31,10 +32,15 @@ class Base(DeclarativeBase):
 _EnumT = TypeVar("_EnumT", bound=Enum)
 
 
-def enum_column(enum_cls: type[_EnumT], name: str) -> Mapped[_EnumT]:
+def enum_column(
+    enum_cls: type[_EnumT], name: str, *, server_default: TextClause | None = None
+) -> Mapped[_EnumT]:
     """Build a PostgreSQL enum column that stores the enum *values*.
 
-    The native enum type is created by Alembic, not by the ORM.
+    The native enum type is created by Alembic, not by the ORM. ``server_default``
+    is passed through so the model can declare one that matches the migration -
+    ``compare_server_default=True`` in the Alembic env would otherwise read the
+    model and the database as having drifted apart.
     """
     return mapped_column(
         SAEnum(
@@ -44,7 +50,8 @@ def enum_column(enum_cls: type[_EnumT], name: str) -> Mapped[_EnumT]:
             create_constraint=False,
             validate_strings=True,
             values_callable=lambda e: [member.value for member in e],
-        )
+        ),
+        server_default=server_default,
     )
 
 

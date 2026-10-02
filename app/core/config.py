@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     # --- Registration --------------------------------------------------
     # The shared ledger is visible to every authenticated church user. Disable
     # public sign-up and provision accounts from the database instead. Roles
-    # (is_superuser, is_active) are always managed in PostgreSQL, never here.
+    # (role, is_active) are always managed in PostgreSQL, never here.
     ALLOW_PUBLIC_REGISTRATION: bool = True
 
     # --- CORS / frontend ----------------------------------------------

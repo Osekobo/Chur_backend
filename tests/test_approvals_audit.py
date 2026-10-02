@@ -47,8 +47,10 @@ def transaction_count(client: TestClient) -> int:
 
 
 class TestApprovals:
-    def test_a_request_starts_pending(self, plain_client: IdentityClient, clean_db: None) -> None:
-        response = plain_client.post(f"{API}/approvals", json=money_out())
+    def test_a_request_starts_pending(
+        self, accountant_client: IdentityClient, clean_db: None
+    ) -> None:
+        response = accountant_client.post(f"{API}/approvals", json=money_out())
         assert response.status_code == 201, response.text
         body = response.json()
         assert body["status"] == "pending"
@@ -58,11 +60,11 @@ class TestApprovals:
         assert body["transaction_id"] is None
 
     def test_a_pending_request_does_not_touch_the_ledger(
-        self, plain_client: IdentityClient, clean_db: None
+        self, accountant_client: IdentityClient, clean_db: None
     ) -> None:
-        before = transaction_count(plain_client)
-        assert plain_client.post(f"{API}/approvals", json=money_out()).status_code == 201
-        assert transaction_count(plain_client) == before
+        before = transaction_count(accountant_client)
+        assert accountant_client.post(f"{API}/approvals", json=money_out()).status_code == 201
+        assert transaction_count(accountant_client) == before
 
     def test_any_signed_in_user_may_raise_a_request(
         self, client: TestClient, clean_db: None
@@ -79,23 +81,41 @@ class TestApprovals:
 
         response = client.post(f"{API}/approvals", json=money_out())
         assert response.status_code == 201, response.text
-        # A non-administrator may see the queue but not decide on it.
+        # An accountant may see the queue, but the buttons on it are decided by
+        # the API, not hidden in the interface - see the secretary test below.
         assert client.get(f"{API}/approvals").status_code == 200
 
-    def test_a_plain_user_cannot_approve(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+    def test_a_secretary_may_raise_but_not_decide(
+        self, secretary_client: IdentityClient, clean_db: None
     ) -> None:
-        approval = plain_client.post(f"{API}/approvals", json=money_out()).json()
-        response = plain_client.post(
-            f"{API}/approvals/{approval['id']}/approve", json={"note": "ok"}
+        """The split that makes the role worth having: raise without authorising."""
+        raised = secretary_client.post(f"{API}/approvals", json=money_out())
+        assert raised.status_code == 201, raised.text
+        approval = raised.json()
+
+        assert secretary_client.get(f"{API}/approvals").status_code == 200
+        assert (
+            secretary_client.post(
+                f"{API}/approvals/{approval['id']}/approve", json={"note": "ok"}
+            ).status_code
+            == 403
         )
-        assert response.status_code == 403
+        assert (
+            secretary_client.post(
+                f"{API}/approvals/{approval['id']}/reject", json={"note": "no"}
+            ).status_code
+            == 403
+        )
+        # Still pending, and still in no ledger: a refused decision moves nothing.
+        queue = secretary_client.get(f"{API}/approvals", params={"status": "pending"}).json()
+        assert [row["id"] for row in queue] == [approval["id"]]
+        assert transaction_count(secretary_client) == 0
 
     def test_approval_records_the_expense_in_the_ledger(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
         """The core promise: an approved request becomes a real Money Out row."""
-        raise_response = plain_client.post(f"{API}/approvals", json=money_out())
+        raise_response = accountant_client.post(f"{API}/approvals", json=money_out())
         assert raise_response.status_code == 201, raise_response.text
         approval = raise_response.json()
 
@@ -119,19 +139,27 @@ class TestApprovals:
         assert entries[0]["id"] == body["transaction_id"]
 
     def test_approval_moves_the_balance_that_a_rejection_does_not(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
-        approved = plain_client.post(f"{API}/approvals", json=money_out(amount="500.00")).json()
-        rejected = plain_client.post(
+        approved = accountant_client.post(
+            f"{API}/approvals", json=money_out(amount="500.00")
+        ).json()
+        rejected = accountant_client.post(
             f"{API}/approvals", json=money_out(amount="900.00")
         ).json()
 
-        assert admin_client.post(
-            f"{API}/approvals/{approved['id']}/approve", json={"note": "ok"}
-        ).status_code == 200
-        assert admin_client.post(
-            f"{API}/approvals/{rejected['id']}/reject", json={"note": "Not this quarter"}
-        ).status_code == 200
+        assert (
+            admin_client.post(
+                f"{API}/approvals/{approved['id']}/approve", json={"note": "ok"}
+            ).status_code
+            == 200
+        )
+        assert (
+            admin_client.post(
+                f"{API}/approvals/{rejected['id']}/reject", json={"note": "Not this quarter"}
+            ).status_code
+            == 200
+        )
 
         balance = admin_client.get(f"{API}/transactions/accounts/balances")
         balances = {row["key"]: Decimal(row["total"]) for row in balance.json()}
@@ -139,12 +167,15 @@ class TestApprovals:
         assert balances["Bank"] == Decimal("-500.00")
 
     def test_a_request_cannot_be_decided_twice(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
-        approval = plain_client.post(f"{API}/approvals", json=money_out()).json()
-        assert admin_client.post(
-            f"{API}/approvals/{approval['id']}/approve", json={"note": "ok"}
-        ).status_code == 200
+        approval = accountant_client.post(f"{API}/approvals", json=money_out()).json()
+        assert (
+            admin_client.post(
+                f"{API}/approvals/{approval['id']}/approve", json={"note": "ok"}
+            ).status_code
+            == 200
+        )
 
         # A retried approve, or an approve after a reject, must be refused - this
         # is what stops a double-click posting the expense twice.
@@ -155,9 +186,9 @@ class TestApprovals:
         assert transaction_count(admin_client) == 1
 
     def test_reject_after_approve_is_refused(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
-        approval = plain_client.post(f"{API}/approvals", json=money_out()).json()
+        approval = accountant_client.post(f"{API}/approvals", json=money_out()).json()
         admin_client.post(f"{API}/approvals/{approval['id']}/approve", json={"note": "ok"})
         response = admin_client.post(
             f"{API}/approvals/{approval['id']}/reject", json={"note": "changed my mind"}
@@ -166,10 +197,10 @@ class TestApprovals:
         assert transaction_count(admin_client) == 1
 
     def test_filtering_by_status_and_the_badge_count(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
-        first = plain_client.post(f"{API}/approvals", json=money_out()).json()
-        second = plain_client.post(f"{API}/approvals", json=money_out(amount="42.00")).json()
+        first = accountant_client.post(f"{API}/approvals", json=money_out()).json()
+        second = accountant_client.post(f"{API}/approvals", json=money_out(amount="42.00")).json()
         admin_client.post(f"{API}/approvals/{first['id']}/approve", json={"note": ""})
 
         counts = admin_client.get(f"{API}/approvals/count").json()
@@ -179,47 +210,39 @@ class TestApprovals:
         assert [row["id"] for row in pending] == [second["id"]]
 
     def test_mine_returns_only_your_own_requests(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
-        mine = plain_client.post(f"{API}/approvals", json=money_out()).json()
+        mine = accountant_client.post(f"{API}/approvals", json=money_out()).json()
         admin_client.post(f"{API}/approvals", json=money_out(amount="10.00"))
 
-        rows = plain_client.get(f"{API}/approvals", params={"mine": "true"}).json()
+        rows = accountant_client.get(f"{API}/approvals", params={"mine": "true"}).json()
         assert [row["id"] for row in rows] == [mine["id"]]
 
     def test_an_invalid_category_is_refused_at_the_gate(
-        self, plain_client: IdentityClient, clean_db: None
+        self, accountant_client: IdentityClient, clean_db: None
     ) -> None:
         # "Tithes" is income, not an expense, so a request may not ask for it -
         # otherwise approval would have to reject it later.
-        response = plain_client.post(f"{API}/approvals", json=money_out(category="Tithes"))
+        response = accountant_client.post(f"{API}/approvals", json=money_out(category="Tithes"))
         assert response.status_code == 422
 
     def test_a_zero_amount_is_refused(self, auth_client: TestClient, clean_db: None) -> None:
-        assert auth_client.post(
-            f"{API}/approvals", json=money_out(amount="0")
-        ).status_code == 422
-        assert auth_client.post(
-            f"{API}/approvals", json=money_out(amount="-5.00")
-        ).status_code == 422
+        assert auth_client.post(f"{API}/approvals", json=money_out(amount="0")).status_code == 422
+        assert (
+            auth_client.post(f"{API}/approvals", json=money_out(amount="-5.00")).status_code == 422
+        )
 
     def test_the_ledger_requires_authentication(self, client: TestClient, clean_db: None) -> None:
         assert client.get(f"{API}/approvals").status_code == 401
         assert client.post(f"{API}/approvals", json=money_out()).status_code == 401
 
-    def test_a_missing_request_is_a_404(
-        self, admin_client: TestClient, clean_db: None
-    ) -> None:
+    def test_a_missing_request_is_a_404(self, admin_client: TestClient, clean_db: None) -> None:
         import uuid
 
-        response = admin_client.post(
-            f"{API}/approvals/{uuid.uuid4()}/approve", json={"note": ""}
-        )
+        response = admin_client.post(f"{API}/approvals/{uuid.uuid4()}/approve", json={"note": ""})
         assert response.status_code == 404
 
-    def test_a_future_date_is_accepted(
-        self, auth_client: TestClient, clean_db: None
-    ) -> None:
+    def test_a_future_date_is_accepted(self, auth_client: TestClient, clean_db: None) -> None:
         """Money can be requested before it leaves, e.g. a bill due next month."""
         future = (date.today() + timedelta(days=30)).isoformat()
         response = auth_client.post(f"{API}/approvals", json=money_out(date=future))
@@ -234,9 +257,9 @@ class TestAuditTrail:
         return response.json()["items"]
 
     def test_reading_the_trail_is_admin_only(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
-        assert plain_client.get(f"{API}/audit").status_code == 403
+        assert accountant_client.get(f"{API}/audit").status_code == 403
         assert admin_client.get(f"{API}/audit").status_code == 200
 
     def test_the_trail_requires_authentication(self, client: TestClient, clean_db: None) -> None:
@@ -269,9 +292,9 @@ class TestAuditTrail:
         assert "password" not in str(matched[0]).lower()
 
     def test_recording_an_expense_names_the_actor_and_the_amount(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
-        plain_client.post(
+        accountant_client.post(
             f"{API}/transactions",
             json={
                 "type": "expense",
@@ -288,9 +311,9 @@ class TestAuditTrail:
         assert "250" in str(entries[0]["changes"])
 
     def test_deleting_a_transaction_keeps_what_it_was(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
-        created = plain_client.post(
+        created = accountant_client.post(
             f"{API}/transactions",
             json={
                 "type": "expense",
@@ -302,7 +325,7 @@ class TestAuditTrail:
                 "date": TODAY,
             },
         ).json()
-        assert plain_client.delete(f"{API}/transactions/{created['id']}").status_code == 200
+        assert accountant_client.delete(f"{API}/transactions/{created['id']}").status_code == 200
 
         entries = self._entries(admin_client, action="delete")
         assert len(entries) == 1
@@ -311,9 +334,9 @@ class TestAuditTrail:
         assert entries[0]["changes"]["party"] == "Kenya Power"
 
     def test_an_approval_leaves_both_an_approval_and_a_ledger_line(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
-        approval = plain_client.post(f"{API}/approvals", json=money_out()).json()
+        approval = accountant_client.post(f"{API}/approvals", json=money_out()).json()
         admin_client.post(f"{API}/approvals/{approval['id']}/approve", json={"note": "ok"})
 
         approval_entries = self._entries(admin_client, action="approve")
@@ -335,26 +358,24 @@ class TestAuditTrail:
                 "email": unique_email(),
                 "full_name": "Promote Me",
                 "password": "StrongPass123",
-                "is_superuser": False,
+                "role": "secretary",
             },
         ).json()
 
-        admin_client.patch(f"{API}/users/{created['id']}", json={"is_superuser": True})
+        admin_client.patch(f"{API}/users/{created['id']}", json={"role": "admin"})
 
         entries = self._entries(admin_client, action="role_change")
         assert len(entries) == 1
-        assert entries[0]["changes"]["is_superuser"] == [False, True]
+        assert entries[0]["changes"]["role"] == ["secretary", "admin"]
 
-    def test_a_password_reset_is_recorded(
-        self, admin_client: TestClient, clean_db: None
-    ) -> None:
+    def test_a_password_reset_is_recorded(self, admin_client: TestClient, clean_db: None) -> None:
         created = admin_client.post(
             f"{API}/users",
             json={
                 "email": unique_email(),
                 "full_name": "Forgot",
                 "password": "StrongPass123",
-                "is_superuser": False,
+                "role": "secretary",
             },
         ).json()
         admin_client.post(
@@ -364,9 +385,7 @@ class TestAuditTrail:
         assert len(entries) == 1
         assert created["email"] in str(entries[0]["summary"])
 
-    def test_a_no_op_update_writes_nothing(
-        self, admin_client: TestClient, clean_db: None
-    ) -> None:
+    def test_a_no_op_update_writes_nothing(self, admin_client: TestClient, clean_db: None) -> None:
         """Re-saving identical values should not claim something changed."""
         created = admin_client.post(
             f"{API}/users",
@@ -374,20 +393,18 @@ class TestAuditTrail:
                 "email": unique_email(),
                 "full_name": "Same",
                 "password": "StrongPass123",
-                "is_superuser": False,
+                "role": "secretary",
             },
         ).json()
         before = len(self._entries(admin_client, entity="user"))
-        admin_client.patch(
-            f"{API}/users/{created['id']}", json={"full_name": created["full_name"]}
-        )
+        admin_client.patch(f"{API}/users/{created['id']}", json={"full_name": created["full_name"]})
         assert len(self._entries(admin_client, entity="user")) == before
 
     def test_pagination_reports_a_total(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
         for index in range(5):
-            plain_client.post(
+            accountant_client.post(
                 f"{API}/transactions",
                 json={
                     "type": "expense",
@@ -410,9 +427,9 @@ class TestAuditTrail:
         assert first_ids.isdisjoint({item["id"] for item in second["items"]})
 
     def test_newest_entries_come_first(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
-        plain_client.post(
+        accountant_client.post(
             f"{API}/transactions",
             json={
                 "type": "expense",
@@ -447,9 +464,9 @@ class TestAuditTrail:
         assert deleted.status_code in (404, 405), deleted.status_code
 
     def test_the_actor_ip_is_recorded(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
-        plain_client.post(
+        accountant_client.post(
             f"{API}/transactions",
             json={
                 "type": "expense",
@@ -464,9 +481,9 @@ class TestAuditTrail:
         assert entries[0]["ip_address"], "the caller address should be captured"
 
     def test_search_matches_the_summary_and_actor(
-        self, plain_client: IdentityClient, admin_client: TestClient, clean_db: None
+        self, accountant_client: IdentityClient, admin_client: TestClient, clean_db: None
     ) -> None:
-        plain_client.post(
+        accountant_client.post(
             f"{API}/transactions",
             json={
                 "type": "expense",
@@ -502,12 +519,10 @@ def _admin(client: TestClient) -> TestClient:
     assert registered.status_code == 201, registered.text
     user_id = registered.json()["user"]["id"]
 
-    engine = create_engine(
-        os.environ["DATABASE_URL"].replace("+asyncpg", "+psycopg2"), future=True
-    )
+    engine = create_engine(os.environ["DATABASE_URL"].replace("+asyncpg", "+psycopg2"), future=True)
     with Session(engine) as session:
         session.execute(
-            text("UPDATE users SET is_superuser = true WHERE id = :id"), {"id": str(user_id)}
+            text("UPDATE users SET role = 'admin' WHERE id = :id"), {"id": str(user_id)}
         )
         session.commit()
     engine.dispose()
