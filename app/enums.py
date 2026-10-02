@@ -34,6 +34,24 @@ class TransactionType(StrEnum):
     EXPENSE = "expense"
 
 
+class DeductionBasis(StrEnum):
+    """What a percentage deduction is taken from on a given day.
+
+    ``TITHES`` is the traditional reading: the percentage comes off the tithe
+    collection alone and Offerings, Donations and the rest are untouched.
+    ``ALL`` takes it off everything collected that day, for churches that remit a
+    percentage of the whole Sunday's take.
+    """
+
+    TITHES = "tithes"
+    ALL = "all"
+
+    @property
+    def label(self) -> str:
+        """How the basis reads in a sentence, e.g. "...of the tithes collected"."""
+        return "tithes" if self is DeductionBasis.TITHES else "money collected"
+
+
 class Account(StrEnum):
     """Payment / holding accounts (asset accounts)."""
 
@@ -50,6 +68,7 @@ class Fund(StrEnum):
     #: One fund per congregation grouping that collects and spends separately.
     YOUTH = "Youth"
     MEN = "Men"
+    WOMEN = "Women"
     SUNDAY_SCHOOL = "Sunday School"
     MISSIONS = "Missions"
     OTHER = "Other"

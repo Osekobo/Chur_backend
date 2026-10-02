@@ -12,6 +12,7 @@ from app.enums import (
     PCT_DEDUCTION_CATEGORY,
     TRANSFER_CATEGORY,
     Account,
+    DeductionBasis,
     ExpenseCategory,
     Fund,
     IncomeCategory,
@@ -244,12 +245,17 @@ class TithesOnDate(BaseModel):
 
 
 class PctDeductionCreate(BaseModel):
-    """Deduct a percentage of one Sunday's tithes, e.g. a diocese remittance."""
+    """Deduct a percentage of one Sunday's collection, e.g. a diocese remittance.
+
+    ``basis`` decides what the percentage is taken from; it defaults to the
+    tithe collection alone so an older client keeps its original behaviour.
+    """
 
     date: date
     pct: MONEY = Field(gt=0, le=100, max_digits=6, decimal_places=2)
     account: Account
     notes: str = Field(default="", max_length=2000)
+    basis: DeductionBasis = DeductionBasis.TITHES
 
     @field_validator("pct")
     @classmethod
@@ -266,8 +272,10 @@ class PctDeductionResult(BaseModel):
     """The created expense entry, with the arithmetic that produced it."""
 
     transaction: TransactionRead
-    tithes_that_day: MONEY
+    #: The collection the percentage was taken from, for the chosen basis.
+    collected_that_day: MONEY
     deduction_amount: MONEY
+    basis: DeductionBasis = DeductionBasis.TITHES
 
 
 class PctDeductionPreview(BaseModel):
@@ -275,5 +283,6 @@ class PctDeductionPreview(BaseModel):
 
     date: date
     pct: MONEY
-    tithes_that_day: MONEY = Decimal("0.00")
+    collected_that_day: MONEY = Decimal("0.00")
     deduction_amount: MONEY = Decimal("0.00")
+    basis: DeductionBasis = DeductionBasis.TITHES
