@@ -15,6 +15,10 @@ htmlcov/
 .env.*
 !.env.example
 
+# Database dumps
+# pg_dump output contains password hashes and row data, so it stays local.
+backup.sql
+
 # Tooling
 .idea/
 .vscode/
