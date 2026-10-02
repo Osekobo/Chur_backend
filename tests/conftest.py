@@ -8,7 +8,7 @@ injected into the environment *before* the application modules are imported.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 # --- Must happen before any `app.*` import so Settings picks it up. ---------
 os.environ.setdefault("ENVIRONMENT", "test")
@@ -223,6 +223,52 @@ class IdentityClient:
 
     def delete(self, url: str, **kwargs: object) -> httpx.Response:
         return self.request("DELETE", url, **kwargs)
+
+
+def insert_person(name: str, role: str = "Member", **fields: str) -> dict[str, str]:
+    """Put one person into the directory and return their id and name.
+
+    Written straight to the database rather than through ``POST /people`` because
+    creating people is a secretary's job and most of these tests are signed in as an
+    accountant - who may read the directory but may not change it.
+
+    A plain function rather than a fixture, so the helpers inside a test module can
+    call it mid-test; every caller runs after ``clean_db`` has already truncated, so
+    the row is never wiped by the next test's setup.
+    """
+    from app.db.models import Person
+    from app.enums import PersonRole
+
+    engine = create_engine(settings.sync_database_url, future=True)
+    try:
+        with Session(engine) as session:
+            person = Person(name=name, role=PersonRole(role), **fields)
+            session.add(person)
+            session.commit()
+            session.refresh(person)
+            return {"id": str(person.id), "name": person.name, "role": role}
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture()
+def directory(clean_db: None) -> Iterator[Callable[..., dict[str, str]]]:
+    """Insert directory rows before the test body runs.
+
+    Depends on ``clean_db`` so the rows are always written after the truncation,
+    whichever order a test declares its fixtures in.
+    """
+    yield insert_person
+
+
+@pytest.fixture()
+def member(directory: Callable[..., dict[str, str]]) -> dict[str, str]:
+    """One person in the directory, for tests that record money in.
+
+    Money in names a giver from the directory, so any test posting an income entry
+    needs somebody to name.
+    """
+    return directory("Mary Achieng")
 
 
 @pytest.fixture()

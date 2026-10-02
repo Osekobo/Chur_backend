@@ -16,7 +16,7 @@ from datetime import date
 
 from fastapi.testclient import TestClient
 
-from tests.conftest import IdentityClient
+from tests.conftest import IdentityClient, insert_person
 
 API = "/api/v1"
 
@@ -43,7 +43,6 @@ EXPENSE = {
 INCOME = {
     "type": "income",
     "category": "Tithes",
-    "party": "Mary Achieng",
     "amount": "4000.00",
     "fund": "General Fund",
     "account": "Bank",
@@ -59,8 +58,12 @@ class TestRoleMatrix:
     def test_a_secretary_can_record_money_in(
         self, secretary_client: IdentityClient, clean_db: None
     ) -> None:
-        response = secretary_client.post(f"{API}/transactions", json=INCOME)
+        """Against a real person: money in has to name someone in the directory."""
+        response = secretary_client.post(
+            f"{API}/transactions", json={**INCOME, "person_id": insert_person("Mary Achieng")["id"]}
+        )
         assert response.status_code == 201, response.text
+        assert response.json()["party"] == "Mary Achieng"
 
     def test_a_secretary_cannot_record_money_out(
         self, secretary_client: IdentityClient, clean_db: None
@@ -148,7 +151,9 @@ class TestRoleMatrix:
         it; an expense is outside her role entirely. Every removal lands in the
         audit trail either way, with the actor's name on it.
         """
-        income = accountant_client.post(f"{API}/transactions", json=INCOME).json()
+        income = accountant_client.post(
+            f"{API}/transactions", json={**INCOME, "person_id": insert_person("Mary Achieng")["id"]}
+        ).json()
         expense = accountant_client.post(f"{API}/transactions", json=EXPENSE).json()
 
         assert secretary_client.delete(f"{API}/transactions/{income['id']}").status_code == 200

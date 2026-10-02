@@ -13,7 +13,7 @@ from sqlalchemy import ColumnElement, case, delete, func, or_, select
 from app.core.config import settings
 from app.core.deps import ClientIp, CurrentUser, DbSession
 from app.core.permissions import ensure_permission, require_permission
-from app.db.models import Transaction, User
+from app.db.models import Person, Transaction, User
 from app.enums import (
     ACCOUNTS,
     FUNDS,
@@ -290,7 +290,22 @@ async def create_transaction(
         if payload.type is TransactionType.INCOME
         else Permission.MONEY_OUT,
     )
-    transaction = Transaction(**payload.model_dump(), created_by_id=user.id)
+    # The giver's name is copied from the directory row rather than accepted from
+    # the client, so the two cannot disagree - and so a name in the ledger is
+    # always a name that existed in the directory when it was written.
+    values = payload.model_dump()
+    if payload.type is TransactionType.INCOME:
+        person = await db.get(Person, payload.person_id)
+        if person is None:
+            raise HTTPException(
+                status_code=404,
+                detail="That person is not in the directory any more. Pick another.",
+            )
+        values["party"] = person.name
+    else:
+        values["party"] = payload.party
+
+    transaction = Transaction(**values, created_by_id=user.id)
     db.add(transaction)
     verb = "recorded" if payload.type is TransactionType.INCOME else "spent"
     await audit.record(
@@ -300,7 +315,7 @@ async def create_transaction(
         entity_id=transaction.id,
         summary=(
             f"{user.full_name} {verb} {payload.amount} for {payload.category}"
-            f"{f' ({payload.party})' if payload.party else ''}"
+            f"{f' ({transaction.party})' if transaction.party else ''}"
         ),
         actor=user,
         changes=audit.snapshot(

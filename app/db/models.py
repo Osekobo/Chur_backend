@@ -187,6 +187,7 @@ class Transaction(Base, TimestampMixin):
         Index("ix_transactions_transfer_id", "transfer_id"),
         Index("ix_transactions_account", "account"),
         Index("ix_transactions_fund", "fund"),
+        Index("ix_transactions_person_id", "person_id"),
         _pct_deduction_index(),
     )
 
@@ -205,6 +206,18 @@ class Transaction(Base, TimestampMixin):
     # that produced the amount even if the Sunday's tithes are later edited.
     pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
     base_total: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    #: Who the money came from, for income. Money in is always recorded against
+    #: someone already in the directory rather than a typed-in name, which is what
+    #: makes "who gave what" answerable without matching on spelling.
+    #:
+    #: Null on three kinds of row, none of them a gift: the income leg of a
+    #: transfer (the church's own money changing account), and entries written
+    #: before this column existed. Those keep ``party`` as the only record of the
+    #: name, and are nulled rather than deleted if the person is removed - see the
+    #: ``ondelete`` below.
+    person_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("people.id", ondelete="SET NULL"), nullable=True
+    )
     created_by_id: Mapped[uuid.UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

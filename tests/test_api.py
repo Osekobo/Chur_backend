@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+from collections.abc import Callable
 from datetime import date
 from decimal import Decimal
 
@@ -9,7 +11,7 @@ from app.enums import TITHE_SCOPE_ALL, TRANSFER_CATEGORY, Account
 from app.schemas.transaction import PctDeductionCreate
 from fastapi.testclient import TestClient
 
-from tests.conftest import TEST_USER, IdentityClient
+from tests.conftest import TEST_USER, IdentityClient, insert_person
 
 API = "/api/v1"
 
@@ -515,11 +517,13 @@ class TestUserAdministration:
 
 
 class TestTransactions:
-    def test_create_list_and_delete(self, auth_client: TestClient) -> None:
+    def test_create_list_and_delete(
+        self, auth_client: TestClient, member: dict[str, str]
+    ) -> None:
         payload = {
             "type": "income",
             "category": "Tithes",
-            "party": "John Doe",
+            "person_id": member["id"],
             "amount": "4500.50",
             "fund": "General Fund",
             "account": "M-PESA",
@@ -529,10 +533,13 @@ class TestTransactions:
         created = auth_client.post(f"{API}/transactions", json=payload)
         assert created.status_code == 201, created.text
         assert created.json()["amount"] == "4500.50"
+        # The giver's name comes from the directory row, not from the request.
+        assert created.json()["party"] == member["name"]
+        assert created.json()["person_id"] == member["id"]
 
         listed = auth_client.get(f"{API}/transactions", params={"type": "income"})
         assert listed.status_code == 200
-        assert any(row["party"] == "John Doe" for row in listed.json())
+        assert any(row["party"] == member["name"] for row in listed.json())
 
         deleted = auth_client.delete(f"{API}/transactions/{created.json()['id']}")
         assert deleted.status_code == 200
@@ -540,6 +547,82 @@ class TestTransactions:
             row["id"] != created.json()["id"]
             for row in auth_client.get(f"{API}/transactions").json()
         )
+
+    def test_income_needs_a_person_from_the_directory(
+        self, auth_client: TestClient
+    ) -> None:
+        """Free text is no longer enough: money in must name someone who exists."""
+        response = auth_client.post(
+            f"{API}/transactions",
+            json={
+                "type": "income",
+                "category": "Tithes",
+                "party": "A. Ochieng",
+                "amount": "100",
+                "account": "Cash",
+                "date": date.today().isoformat(),
+            },
+        )
+        assert response.status_code == 422
+        assert "directory" in response.text
+
+    def test_income_with_an_unknown_person_is_refused(
+        self, auth_client: TestClient
+    ) -> None:
+        response = auth_client.post(
+            f"{API}/transactions",
+            json={
+                "type": "income",
+                "category": "Tithes",
+                "person_id": str(uuid.uuid4()),
+                "amount": "100",
+                "account": "Cash",
+                "date": date.today().isoformat(),
+            },
+        )
+        assert response.status_code == 404
+
+    def test_expense_cannot_carry_a_person(
+        self, auth_client: TestClient, member: dict[str, str]
+    ) -> None:
+        """A person is who money came from, not who it was paid to."""
+        response = auth_client.post(
+            f"{API}/transactions",
+            json={
+                "type": "expense",
+                "category": "Suppliers",
+                "person_id": member["id"],
+                "amount": "100",
+                "account": "Cash",
+                "date": date.today().isoformat(),
+            },
+        )
+        assert response.status_code == 422
+
+    def test_deleting_a_person_keeps_their_giving(
+        self, admin_client: TestClient, member: dict[str, str]
+    ) -> None:
+        """The history of what was given outlives the directory entry."""
+        created = admin_client.post(
+            f"{API}/transactions",
+            json={
+                "type": "income",
+                "category": "Offerings",
+                "person_id": member["id"],
+                "amount": "750",
+                "account": "Cash",
+                "date": date.today().isoformat(),
+            },
+        )
+        assert created.status_code == 201, created.text
+
+        removed = admin_client.delete(f"{API}/people/{member['id']}")
+        assert removed.status_code == 200, removed.text
+
+        rows = admin_client.get(f"{API}/transactions", params={"category": "Offerings"}).json()
+        row = next(r for r in rows if r["id"] == created.json()["id"])
+        assert row["person_id"] is None
+        assert row["party"] == member["name"]
 
     def test_income_cannot_use_an_expense_category(self, auth_client: TestClient) -> None:
         response = auth_client.post(
@@ -698,14 +781,16 @@ class TestPeople:
 
 
 class TestReporting:
-    def test_dashboard_totals_reflect_recorded_entries(self, auth_client: TestClient) -> None:
+    def test_dashboard_totals_reflect_recorded_entries(
+        self, auth_client: TestClient, member: dict[str, str]
+    ) -> None:
         today = date.today().isoformat()
         auth_client.post(
             f"{API}/transactions",
             json={
                 "type": "income",
                 "category": "Tithes",
-                "party": "Peter Mwangi",
+                "person_id": member["id"],
                 "amount": "10000",
                 "fund": "Building",
                 "account": "Bank",
@@ -751,7 +836,10 @@ class TestReporting:
             statements
         )
 
-    def test_member_contribution_history(self, auth_client: TestClient) -> None:
+    def test_member_contribution_history(
+        self, auth_client: TestClient, directory: Callable[..., dict[str, str]]
+    ) -> None:
+        giver = directory("Samuel Kiptoo")
         today = date.today().isoformat()
         for amount, category in (("3000", "Tithes"), ("1500", "Offerings")):
             auth_client.post(
@@ -759,7 +847,7 @@ class TestReporting:
                 json={
                     "type": "income",
                     "category": category,
-                    "party": "Samuel Kiptoo",
+                    "person_id": giver["id"],
                     "amount": amount,
                     "account": "Cash",
                     "date": today,
@@ -806,13 +894,16 @@ class TestPercentageDeduction:
     SUNDAY = date(2026, 3, 8).isoformat()
 
     def _record_tithes(self, client: TestClient, *amounts: str, account: str = "Bank") -> None:
+        # The giver has to exist before the entry does: money in names a person from
+        # the directory, so the helper creates one the first time it is called.
+        giver = insert_person("Mary Achieng")
         for amount in amounts:
             response = client.post(
                 f"{API}/transactions",
                 json={
                     "type": "income",
                     "category": "Tithes",
-                    "party": "Mary Achieng",
+                    "person_id": giver["id"],
                     "amount": amount,
                     "fund": "General Fund",
                     "account": account,
@@ -830,6 +921,7 @@ class TestPercentageDeduction:
             json={
                 "type": "income",
                 "category": "Offerings",
+                "person_id": insert_person("Samuel Kiptoo")["id"],
                 "amount": "500",
                 "account": "Bank",
                 "date": self.SUNDAY,
@@ -1013,6 +1105,7 @@ class TestPercentageDeduction:
             json={
                 "type": "income",
                 "category": category,
+                "person_id": insert_person("Mary Achieng")["id"],
                 "amount": amount,
                 "account": "Bank",
                 "date": self.SUNDAY,
@@ -1218,7 +1311,7 @@ class TestContributionSearch:
             json={
                 "type": "income",
                 "category": category,
-                "party": party,
+                "person_id": insert_person(party)["id"],
                 "amount": amount,
                 "account": "Cash",
                 "date": date.today().isoformat(),
@@ -1297,8 +1390,14 @@ class TestFundSummary:
     def test_reports_received_spent_and_net_for_every_fund(
         self, auth_client: TestClient, clean_db: None
     ) -> None:
+        giver = insert_person("Mary Achieng")
         for payload in (
-            {"type": "income", "category": "Tithes", "amount": "1000", "fund": "Building"},
+            {
+                "type": "income",
+                "category": "Tithes",
+                "amount": "1000",
+                "fund": "Building",
+            },
             {"type": "expense", "category": "Suppliers", "amount": "250", "fund": "Building"},
             {"type": "income", "category": "Offerings", "amount": "500", "fund": "Missions"},
         ):
@@ -1306,6 +1405,7 @@ class TestFundSummary:
                 f"{API}/transactions",
                 json={
                     **payload,
+                    **({"person_id": giver["id"]} if payload["type"] == "income" else {}),
                     "account": "Cash",
                     "date": date.today().isoformat(),
                 },

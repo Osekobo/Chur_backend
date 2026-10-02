@@ -36,6 +36,9 @@ class TransactionBase(BaseModel):
     pct: MONEY | None = Field(default=None, ge=0, le=100, max_digits=6, decimal_places=2)
     #: The tithe total the percentage was taken from.
     base_total: MONEY | None = Field(default=None, ge=0, max_digits=14, decimal_places=2)
+    #: Who the money came from. Required for money in, refused for money out:
+    #: a giver is someone in the directory, not a name typed into a box.
+    person_id: uuid.UUID | None = None
 
     @field_validator("amount")
     @classmethod
@@ -69,6 +72,23 @@ class TransactionBase(BaseModel):
             raise ValueError(f"Fund must be one of: {', '.join(f.value for f in Fund)}.")
         return self
 
+    @model_validator(mode="after")
+    def _check_person_matches_direction(self) -> TransactionBase:
+        """Money in names a giver; money out does not.
+
+        Checked here rather than only in the route so the approval endpoint - which
+        rebuilds a request through this same schema before writing the ledger - is
+        held to the same rule by construction.
+        """
+        if self.type is TransactionType.INCOME:
+            if self.person_id is None:
+                raise ValueError(
+                    "Money in must be recorded against a person from the directory."
+                )
+        elif self.person_id is not None:
+            raise ValueError("Only money in can be recorded against a person.")
+        return self
+
 
 class TransactionCreate(TransactionBase):
     """Write model — validated, and only accepts real income/expense entries."""
@@ -93,6 +113,7 @@ class TransactionRead(ORMModel):
     transfer_id: uuid.UUID | None = None
     pct: MONEY | None = None
     base_total: MONEY | None = None
+    person_id: uuid.UUID | None = None
     created_by_id: uuid.UUID | None = None
     created_at: datetime
     updated_at: datetime
