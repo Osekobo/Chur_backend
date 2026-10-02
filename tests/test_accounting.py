@@ -10,7 +10,7 @@ from enum import StrEnum
 from typing import Any
 
 import pytest
-from app.enums import TRANSFER_CATEGORY, Account, Fund
+from app.enums import FUNDS, TRANSFER_CATEGORY, Account, Fund
 from app.services import accounting
 
 
@@ -137,7 +137,9 @@ class TestBalances:
                 ),
             ]
         )
-        assert len(funds) == 5
+        # Every fund appears, including the ones with no activity, so the
+        # assertion follows the enum rather than a hard-coded count.
+        assert [f.key for f in funds] == list(FUNDS)
         assert next(f for f in funds if f.key == "Building").total == Decimal("300.00")
 
     def test_transfers_do_not_affect_income_or_expenses(self) -> None:

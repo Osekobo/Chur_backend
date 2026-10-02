@@ -47,7 +47,10 @@ class Fund(StrEnum):
 
     GENERAL = "General Fund"
     BUILDING = "Building"
+    #: One fund per congregation grouping that collects and spends separately.
     YOUTH = "Youth"
+    MEN = "Men"
+    SUNDAY_SCHOOL = "Sunday School"
     MISSIONS = "Missions"
     OTHER = "Other"
 
