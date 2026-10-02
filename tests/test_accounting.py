@@ -282,6 +282,34 @@ class TestDeductionAmount:
         second = accounting.deduction_amount(base, Decimal("10"))
         assert first == second == Decimal("100.00")
 
+    def test_shares_add_back_up_to_the_single_figure_total(self) -> None:
+        tithes = {Account.CASH: Decimal("333.33"), Account.BANK: Decimal("666.67")}
+        shares = accounting.deduction_shares(tithes, Decimal("10"))
+        total = accounting.deduction_amount(Decimal("1000.00"), Decimal("10"))
+        # Rounding each share alone would land a cent away from the total.
+        assert sum(share.amount for share in shares) == total
+        assert {share.account: share.amount for share in shares} == {
+            Account.CASH: Decimal("33.33"),
+            Account.BANK: Decimal("66.67"),
+        }
+
+    def test_a_single_account_share_needs_no_rounding_correction(self) -> None:
+        shares = accounting.deduction_shares({Account.BANK: Decimal("4000.00")}, Decimal("10"))
+        assert [share.amount for share in shares] == [Decimal("400.00")]
+
+    def test_accounts_with_no_tithes_are_left_out(self) -> None:
+        shares = accounting.deduction_shares(
+            {Account.CASH: Decimal("0.00"), Account.BANK: Decimal("1000.00")}, Decimal("10")
+        )
+        assert [share.account for share in shares] == [Account.BANK]
+
+    def test_a_share_that_rounds_to_nothing_is_not_posted(self) -> None:
+        shares = accounting.deduction_shares(
+            {Account.CASH: Decimal("1.00"), Account.BANK: Decimal("1000.00")}, Decimal("0.1")
+        )
+        # 0.1% of 1.00 is 0.001, which is not an entry; the Bank share stands.
+        assert [share.account for share in shares] == [Account.BANK]
+
 
 class TestAccountType:
     @pytest.mark.parametrize(

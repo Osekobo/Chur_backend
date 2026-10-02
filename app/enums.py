@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Literal
 
 
 class PersonRole(StrEnum):
@@ -34,30 +35,26 @@ class TransactionType(StrEnum):
     EXPENSE = "expense"
 
 
-class DeductionBasis(StrEnum):
-    """What a percentage deduction is taken from on a given day.
-
-    ``TITHES`` is the traditional reading: the percentage comes off the tithe
-    collection alone and Offerings, Donations and the rest are untouched.
-    ``ALL`` takes it off everything collected that day, for churches that remit a
-    percentage of the whole Sunday's take.
-    """
-
-    TITHES = "tithes"
-    ALL = "all"
-
-    @property
-    def label(self) -> str:
-        """How the basis reads in a sentence, e.g. "...of the tithes collected"."""
-        return "tithes" if self is DeductionBasis.TITHES else "money collected"
-
-
 class Account(StrEnum):
     """Payment / holding accounts (asset accounts)."""
 
     CASH = "Cash"
     BANK = "Bank"
     M_PESA = "M-PESA"
+
+
+#: The extra row in a Tithe % Deduction account dropdown: "the tithes collected
+#: that day, whichever account they came into". Paired with the ``Account`` values
+#: to make the dropdown four rows long without a parallel enum to keep in step.
+TITHE_SCOPE_ALL = "all"
+
+#: Reads in the 422 raised when the chosen scope has no tithes to work on.
+TITHE_SCOPE_ALL_LABEL = "any account"
+
+#: What the deduction field accepts: one account, or every account. The literal
+#: has to be spelled out here for mypy, so a test asserts it matches
+#: ``TITHE_SCOPE_ALL`` rather than letting the two drift apart silently.
+TitheScope = Account | Literal["all"]
 
 
 class Fund(StrEnum):

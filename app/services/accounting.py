@@ -6,7 +6,7 @@ records so the accounting rules can be unit tested without a database.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Protocol
@@ -17,6 +17,7 @@ from app.enums import (
     FUNDS,
     INCOME_CATEGORIES,
     TRANSFER_CATEGORY,
+    Account,
     AccountType,
     IncomeCategory,
 )
@@ -299,6 +300,54 @@ def deduction_amount(base: Decimal, pct: Decimal) -> Decimal:
     base = Decimal(base).quantize(Decimal("0.01"))
     pct = Decimal(pct)
     return (base * pct / Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+@dataclass(frozen=True, slots=True)
+class DeductionShare:
+    """One account's part of a percentage deduction."""
+
+    account: Account
+    #: Tithes collected into this account.
+    tithes: Decimal
+    #: This account's share of the deduction.
+    amount: Decimal
+
+
+def deduction_shares(tithes: Mapping[Account, Decimal], pct: Decimal) -> list[DeductionShare]:
+    """Take ``pct`` off each account's tithes, keeping every account honest.
+
+    Deducing per account and posting one row per account means a Cash balance is
+    only reduced by the part that came out of Cash, rather than one account
+    absorbing a deduction the collection paid for.
+
+    Rounding each share to the cent can leave the shares a cent or two off the
+    single-figure total (``deduction_amount`` of the whole collection), so the
+    largest share absorbs the difference. The shares then always add back up to
+    exactly that figure.
+    """
+    shares = [
+        DeductionShare(account=account, tithes=total, amount=deduction_amount(total, pct))
+        for account, total in tithes.items()
+        if total > 0
+    ]
+    # A share that rounds to 0.00 is not an entry: the ledger forbids amount <= 0.
+    shares = [share for share in shares if share.amount > 0]
+    if len(shares) < 2:
+        return shares
+
+    target = deduction_amount(sum((share.tithes for share in shares), Decimal("0.00")), pct)
+    drift = target - sum((share.amount for share in shares), Decimal("0.00"))
+    if drift == 0:
+        return shares
+
+    # The biggest collection carries the rounding, with the later row winning a
+    # tie so the choice stays deterministic.
+    index = max(range(len(shares)), key=lambda i: (shares[i].tithes, i))
+    adjusted = shares[index].amount + drift
+    shares[index] = DeductionShare(
+        account=shares[index].account, tithes=shares[index].tithes, amount=adjusted
+    )
+    return [share for share in shares if share.amount > 0]
 
 
 @dataclass(frozen=True, slots=True)

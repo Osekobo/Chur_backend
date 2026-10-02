@@ -5,7 +5,8 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from app.enums import TRANSFER_CATEGORY
+from app.enums import TITHE_SCOPE_ALL, TRANSFER_CATEGORY, Account
+from app.schemas.transaction import PctDeductionCreate
 from fastapi.testclient import TestClient
 
 from tests.conftest import TEST_USER
@@ -762,11 +763,15 @@ class TestReporting:
 
 
 class TestPercentageDeduction:
-    """The Tithe % Deduction page: deduct a slice of what one Sunday brought in."""
+    """The Tithe % Deduction page: deduct a slice of one Sunday's tithe collection.
+
+    The account in the form picks which collection is read and where the money
+    leaves from; ``all`` covers every account that held tithes that day.
+    """
 
     SUNDAY = date(2026, 3, 8).isoformat()
 
-    def _record_tithes(self, client: TestClient, *amounts: str) -> None:
+    def _record_tithes(self, client: TestClient, *amounts: str, account: str = "Bank") -> None:
         for amount in amounts:
             response = client.post(
                 f"{API}/transactions",
@@ -776,7 +781,7 @@ class TestPercentageDeduction:
                     "party": "Mary Achieng",
                     "amount": amount,
                     "fund": "General Fund",
-                    "account": "Bank",
+                    "account": account,
                     "date": self.SUNDAY,
                 },
             )
@@ -827,11 +832,13 @@ class TestPercentageDeduction:
         assert response.status_code == 201, response.text
         body = response.json()
         assert Decimal(body["deduction_amount"]) == Decimal("400.00")
-        assert Decimal(body["collected_that_day"]) == Decimal("4000.00")
+        assert Decimal(body["tithes_that_day"]) == Decimal("4000.00")
 
-        entry = body["transaction"]
+        assert len(body["transactions"]) == 1
+        entry = body["transactions"][0]
         assert entry["type"] == "expense"
         assert entry["category"] == "Percentage Deduction"
+        assert entry["account"] == "Bank"
         assert entry["fund"] == "General Fund"
         assert entry["party"] == "Diocese remittance"
         assert entry["pct"] == "10.00"
@@ -852,7 +859,7 @@ class TestPercentageDeduction:
         self._record_tithes(auth_client, "5000")
         auth_client.post(
             f"{API}/transactions/pct-deduction",
-            json={"date": self.SUNDAY, "pct": "12.5", "account": "M-PESA"},
+            json={"date": self.SUNDAY, "pct": "12.5", "account": "Bank"},
         )
 
         history = auth_client.get(f"{API}/transactions/pct-deductions").json()
@@ -882,6 +889,18 @@ class TestPercentageDeduction:
         assert response.status_code == 422
         assert "nothing to deduct" in response.json()["detail"]
 
+    def test_choosing_an_account_with_no_tithes_is_refused(
+        self, auth_client: TestClient, clean_db: None
+    ) -> None:
+        # The tithes went into the Bank, so asking for Cash has nothing to work on.
+        self._record_tithes(auth_client, "4000")
+        response = auth_client.post(
+            f"{API}/transactions/pct-deduction",
+            json={"date": self.SUNDAY, "pct": "10", "account": "Cash"},
+        )
+        assert response.status_code == 422
+        assert "No Tithes were collected in Cash" in response.json()["detail"]
+
     def test_zero_and_over_100_percentages_are_rejected(
         self, auth_client: TestClient, clean_db: None
     ) -> None:
@@ -900,7 +919,7 @@ class TestPercentageDeduction:
         self._record_tithes(auth_client, "1")
         response = auth_client.post(
             f"{API}/transactions/pct-deduction",
-            json={"date": self.SUNDAY, "pct": "0.1", "account": "Cash"},
+            json={"date": self.SUNDAY, "pct": "0.1", "account": "Bank"},
         )
         assert response.status_code == 422
         assert "KSh 0" in response.json()["detail"]
@@ -911,9 +930,9 @@ class TestPercentageDeduction:
         self._record_tithes(auth_client, "8333.33")
         preview = auth_client.get(
             f"{API}/accounting/pct-deduction-preview",
-            params={"date": self.SUNDAY, "pct": "7.5"},
+            params={"date": self.SUNDAY, "pct": "7.5", "account": "Bank"},
         ).json()
-        assert Decimal(preview["collected_that_day"]) == Decimal("8333.33")
+        assert Decimal(preview["tithes_that_day"]) == Decimal("8333.33")
         assert Decimal(preview["deduction_amount"]) == Decimal("625.00")
 
     def test_pct_cannot_be_set_on_an_ordinary_expense(
@@ -946,7 +965,13 @@ class TestPercentageDeduction:
         assert trial["is_balanced"] is True
         assert trial["difference"] == "0.00"
 
-    # ------------------------------------------------------------------ basis --
+    # ------------------------------------------------------- account scope --
+
+    def _balances(self, client: TestClient) -> dict[str, Decimal]:
+        return {
+            row["key"]: Decimal(row["total"])
+            for row in client.get(f"{API}/transactions/accounts/balances").json()
+        }
 
     def _record_income(self, client: TestClient, category: str, amount: str) -> None:
         response = client.post(
@@ -961,10 +986,12 @@ class TestPercentageDeduction:
         )
         assert response.status_code == 201, response.text
 
-    def test_basis_defaults_to_tithes_only(self, auth_client: TestClient, clean_db: None) -> None:
-        # An older client that never heard of `basis` must keep its old meaning.
+    def test_the_account_picks_which_collection_is_read(
+        self, auth_client: TestClient, clean_db: None
+    ) -> None:
         self._record_tithes(auth_client, "4000")
-        self._record_income(auth_client, "Offerings", "500")
+        self._record_tithes(auth_client, "1000", account="Cash")
+        self._record_tithes(auth_client, "500", account="M-PESA")
 
         response = auth_client.post(
             f"{API}/transactions/pct-deduction",
@@ -972,38 +999,91 @@ class TestPercentageDeduction:
         )
         assert response.status_code == 201, response.text
         body = response.json()
-        assert body["basis"] == "tithes"
-        assert Decimal(body["collected_that_day"]) == Decimal("4000.00")
+        # Only the Bank's tithes; the 1,500 sitting in Cash and M-PESA is ignored.
+        assert Decimal(body["tithes_that_day"]) == Decimal("4000.00")
         assert Decimal(body["deduction_amount"]) == Decimal("400.00")
+        assert [row["account"] for row in body["transactions"]] == ["Bank"]
 
-    def test_all_basis_sums_every_category_collected(
+    def test_only_the_tithes_category_is_ever_read(
         self, auth_client: TestClient, clean_db: None
     ) -> None:
         self._record_tithes(auth_client, "4000")
-        self._record_income(auth_client, "Offerings", "500")
-        self._record_income(auth_client, "Donations", "100")
+        self._record_income(auth_client, "Offerings", "2000")
 
         response = auth_client.post(
             f"{API}/transactions/pct-deduction",
-            json={
-                "date": self.SUNDAY,
-                "pct": "10",
-                "account": "Bank",
-                "basis": "all",
-            },
+            json={"date": self.SUNDAY, "pct": "10", "account": "all"},
+        )
+        assert response.status_code == 201, response.text
+        assert Decimal(response.json()["tithes_that_day"]) == Decimal("4000.00")
+
+    def test_all_covers_every_account_and_splits_the_deduction(
+        self, auth_client: TestClient, clean_db: None
+    ) -> None:
+        self._record_tithes(auth_client, "4000")
+        self._record_tithes(auth_client, "3000", account="Cash")
+        self._record_tithes(auth_client, "1000", account="M-PESA")
+        before = self._balances(auth_client)
+
+        response = auth_client.post(
+            f"{API}/transactions/pct-deduction",
+            json={"date": self.SUNDAY, "pct": "10", "account": "all"},
         )
         assert response.status_code == 201, response.text
         body = response.json()
-        assert body["basis"] == "all"
-        assert Decimal(body["collected_that_day"]) == Decimal("4600.00")
-        assert Decimal(body["deduction_amount"]) == Decimal("460.00")
-        assert body["transaction"]["base_total"] == "4600.00"
+        assert Decimal(body["tithes_that_day"]) == Decimal("8000.00")
+        assert Decimal(body["deduction_amount"]) == Decimal("800.00")
+        assert {share["account"]: share["deduction_amount"] for share in body["shares"]} == {
+            "Bank": "400.00",
+            "Cash": "300.00",
+            "M-PESA": "100.00",
+        }
 
-    def test_all_basis_ignores_internal_transfers(
+        # One entry per account, each for its own share, so no balance pays for
+        # tithes collected somewhere else.
+        assert sorted(row["account"] for row in body["transactions"]) == [
+            "Bank",
+            "Cash",
+            "M-PESA",
+        ]
+        assert {row["account"]: row["base_total"] for row in body["transactions"]} == {
+            "Bank": "4000.00",
+            "Cash": "3000.00",
+            "M-PESA": "1000.00",
+        }
+        after = self._balances(auth_client)
+        assert before["Bank"] - after["Bank"] == Decimal("400.00")
+        assert before["Cash"] - after["Cash"] == Decimal("300.00")
+        assert before["M-PESA"] - after["M-PESA"] == Decimal("100.00")
+
+    def test_all_with_one_account_holding_tithes_posts_one_entry(
         self, auth_client: TestClient, clean_db: None
     ) -> None:
-        # A transfer writes an income leg, but the money only changed account, so
-        # it must not inflate the base.
+        self._record_tithes(auth_client, "4000")
+        response = auth_client.post(
+            f"{API}/transactions/pct-deduction",
+            json={"date": self.SUNDAY, "pct": "10", "account": "all"},
+        )
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert [row["account"] for row in body["transactions"]] == ["Bank"]
+        assert Decimal(body["deduction_amount"]) == Decimal("400.00")
+
+    def test_all_is_refused_when_no_account_held_tithes(
+        self, auth_client: TestClient, clean_db: None
+    ) -> None:
+        response = auth_client.post(
+            f"{API}/transactions/pct-deduction",
+            json={"date": "2026-03-01", "pct": "10", "account": "all"},
+        )
+        assert response.status_code == 422
+        assert "any account" in response.json()["detail"]
+
+    def test_a_transfer_is_not_treated_as_collected_tithes(
+        self, auth_client: TestClient, clean_db: None
+    ) -> None:
+        # Moving money from the Bank into Cash that day must not make Cash look
+        # like it collected anything.
         self._record_tithes(auth_client, "4000")
         response = auth_client.post(
             f"{API}/transactions/transfers",
@@ -1016,73 +1096,82 @@ class TestPercentageDeduction:
         )
         assert response.status_code == 201, response.text
 
-        response = auth_client.post(
+        refused = auth_client.post(
             f"{API}/transactions/pct-deduction",
-            json={"date": self.SUNDAY, "pct": "10", "account": "Bank", "basis": "all"},
+            json={"date": self.SUNDAY, "pct": "10", "account": "Cash"},
         )
-        assert response.status_code == 201, response.text
-        body = response.json()
-        assert Decimal(body["collected_that_day"]) == Decimal("4000.00")
-        assert Decimal(body["deduction_amount"]) == Decimal("400.00")
+        assert refused.status_code == 422
 
-    def test_all_basis_still_ignores_an_expense_that_day(
+        accepted = auth_client.post(
+            f"{API}/transactions/pct-deduction",
+            json={"date": self.SUNDAY, "pct": "10", "account": "all"},
+        )
+        assert accepted.status_code == 201, accepted.text
+        assert Decimal(accepted.json()["tithes_that_day"]) == Decimal("4000.00")
+
+    def test_preview_follows_the_chosen_account(
         self, auth_client: TestClient, clean_db: None
     ) -> None:
         self._record_tithes(auth_client, "4000")
-        auth_client.post(
-            f"{API}/transactions",
-            json={
-                "type": "expense",
-                "category": "Expenses",
-                "amount": "900",
-                "account": "Cash",
-                "date": self.SUNDAY,
-            },
-        )
-        response = auth_client.post(
-            f"{API}/transactions/pct-deduction",
-            json={"date": self.SUNDAY, "pct": "10", "account": "Bank", "basis": "all"},
-        )
-        body = response.json()
-        assert Decimal(body["collected_that_day"]) == Decimal("4000.00")
+        self._record_tithes(auth_client, "1000", account="Cash")
 
-    def test_preview_follows_the_chosen_basis(
+        def preview(**params: str) -> dict[str, object]:
+            response = auth_client.get(
+                f"{API}/accounting/pct-deduction-preview",
+                params={"date": self.SUNDAY, "pct": "10", **params},
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        bank = preview(account="Bank")
+        assert Decimal(bank["tithes_that_day"]) == Decimal("4000.00")  # type: ignore[arg-type]
+        assert Decimal(bank["deduction_amount"]) == Decimal("400.00")  # type: ignore[arg-type]
+
+        cash = preview(account="Cash")
+        assert Decimal(cash["tithes_that_day"]) == Decimal("1000.00")  # type: ignore[arg-type]
+        assert Decimal(cash["deduction_amount"]) == Decimal("100.00")  # type: ignore[arg-type]
+
+        # No account given falls back to Cash, the first row of the dropdown.
+        default = preview()
+        assert Decimal(default["tithes_that_day"]) == Decimal("1000.00")  # type: ignore[arg-type]
+
+        everything = preview(account="all")
+        assert Decimal(everything["tithes_that_day"]) == Decimal("5000.00")  # type: ignore[arg-type]
+        assert Decimal(everything["deduction_amount"]) == Decimal("500.00")  # type: ignore[arg-type]
+        assert {share["account"] for share in everything["shares"]} == {"Bank", "Cash"}  # type: ignore[union-attr]
+
+    def test_the_scope_allows_the_accounts_and_all_only(
         self, auth_client: TestClient, clean_db: None
     ) -> None:
         self._record_tithes(auth_client, "4000")
-        self._record_income(auth_client, "Offerings", "500")
+        for account in ("Cash", "Bank", "M-PESA", "all"):
+            accepted = auth_client.get(
+                f"{API}/accounting/pct-deduction-preview",
+                params={"date": self.SUNDAY, "pct": "10", "account": account},
+            )
+            assert accepted.status_code == 200, f"{account} was refused"
 
-        params = {"date": self.SUNDAY, "pct": "10"}
-        tithes_only = auth_client.get(
-            f"{API}/accounting/pct-deduction-preview", params=params
-        ).json()
-        everything = auth_client.get(
-            f"{API}/accounting/pct-deduction-preview", params={**params, "basis": "all"}
-        ).json()
+        for account in ("Cheque", "ALL", "Petty Cash", ""):
+            refused = auth_client.post(
+                f"{API}/transactions/pct-deduction",
+                json={"date": self.SUNDAY, "pct": "10", "account": account},
+            )
+            assert refused.status_code == 422, f"{account!r} was accepted"
 
-        assert tithes_only["basis"] == "tithes"
-        assert Decimal(tithes_only["deduction_amount"]) == Decimal("400.00")
-        assert everything["basis"] == "all"
-        assert Decimal(everything["collected_that_day"]) == Decimal("4500.00")
-        assert Decimal(everything["deduction_amount"]) == Decimal("450.00")
-
-    def test_all_basis_is_refused_when_nothing_was_collected(
-        self, auth_client: TestClient, clean_db: None
-    ) -> None:
-        response = auth_client.post(
-            f"{API}/transactions/pct-deduction",
-            json={"date": "2026-03-01", "pct": "10", "account": "Cash", "basis": "all"},
+    def test_the_scope_constant_and_the_schema_literal_agree(self) -> None:
+        # mypy will not take a variable inside Literal[], so TitheScope spells the
+        # "all" literal out by hand. This pins the copy to the constant the route
+        # compares against, so the two cannot drift apart unnoticed.
+        assert TITHE_SCOPE_ALL == "all"
+        payload = PctDeductionCreate(
+            date=date(2026, 3, 8),
+            pct=Decimal("10"),
+            account=TITHE_SCOPE_ALL,
         )
-        assert response.status_code == 422
-        assert "nothing to deduct" in response.json()["detail"]
-
-    def test_unknown_basis_is_rejected(self, auth_client: TestClient, clean_db: None) -> None:
-        self._record_tithes(auth_client, "4000")
-        response = auth_client.post(
-            f"{API}/transactions/pct-deduction",
-            json={"date": self.SUNDAY, "pct": "10", "account": "Bank", "basis": "everything"},
-        )
-        assert response.status_code == 422
+        assert payload.account == "all"
+        assert PctDeductionCreate(
+            date=date(2026, 3, 8), pct=Decimal("10"), account="Cash"
+        ).account is Account.CASH
 
 
 class TestContributionSearch:

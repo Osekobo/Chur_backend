@@ -12,10 +12,10 @@ from app.enums import (
     PCT_DEDUCTION_CATEGORY,
     TRANSFER_CATEGORY,
     Account,
-    DeductionBasis,
     ExpenseCategory,
     Fund,
     IncomeCategory,
+    TitheScope,
     TransactionType,
 )
 from app.schemas.common import ORMModel
@@ -245,17 +245,18 @@ class TithesOnDate(BaseModel):
 
 
 class PctDeductionCreate(BaseModel):
-    """Deduct a percentage of one Sunday's collection, e.g. a diocese remittance.
+    """Deduct a percentage of one Sunday's tithes, e.g. a diocese remittance.
 
-    ``basis`` decides what the percentage is taken from; it defaults to the
-    tithe collection alone so an older client keeps its original behaviour.
+    ``account`` is both the scope and the destination: an ``Account`` value takes
+    the percentage off the tithes collected into that account and posts the
+    deduction to that same account, while ``"all"`` uses the tithes collected that
+    day across every account and splits the deduction between them.
     """
 
     date: date
     pct: MONEY = Field(gt=0, le=100, max_digits=6, decimal_places=2)
-    account: Account
+    account: TitheScope
     notes: str = Field(default="", max_length=2000)
-    basis: DeductionBasis = DeductionBasis.TITHES
 
     @field_validator("pct")
     @classmethod
@@ -268,14 +269,30 @@ class PctDeductionCreate(BaseModel):
         return value.strip()
 
 
-class PctDeductionResult(BaseModel):
-    """The created expense entry, with the arithmetic that produced it."""
+class DeductionShare(BaseModel):
+    """One account's part of a deduction, so a split can be shown as it happens."""
 
-    transaction: TransactionRead
-    #: The collection the percentage was taken from, for the chosen basis.
-    collected_that_day: MONEY
+    account: Account
+    #: Tithes collected into this account on the date.
+    tithes: MONEY
+    #: This account's share of the deduction.
     deduction_amount: MONEY
-    basis: DeductionBasis = DeductionBasis.TITHES
+
+
+class PctDeductionResult(BaseModel):
+    """The created expense entries, with the arithmetic that produced them.
+
+    ``transactions`` holds one row when a single account was chosen and one row
+    per account that held tithes when the scope was ``"all"``, so every account
+    keeps the share that actually came out of it.
+    """
+
+    transactions: list[TransactionRead]
+    #: Tithes the percentage was taken from, for the chosen scope.
+    tithes_that_day: MONEY
+    #: Total across every created row.
+    deduction_amount: MONEY
+    shares: list[DeductionShare] = Field(default_factory=list)
 
 
 class PctDeductionPreview(BaseModel):
@@ -283,6 +300,8 @@ class PctDeductionPreview(BaseModel):
 
     date: date
     pct: MONEY
-    collected_that_day: MONEY = Decimal("0.00")
+    #: Tithes in the chosen scope on this date.
+    tithes_that_day: MONEY = Decimal("0.00")
     deduction_amount: MONEY = Decimal("0.00")
-    basis: DeductionBasis = DeductionBasis.TITHES
+    #: Per-account breakdown, empty when the chosen account has no tithes.
+    shares: list[DeductionShare] = Field(default_factory=list)
