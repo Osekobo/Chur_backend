@@ -129,6 +129,12 @@ class Person(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_people_lower_name", text("lower(name)")),
         Index("ix_people_role", "role"),
+        # Within a role, a name identifies a person. Two "Angela Ochieng" rows
+        # would split one person's giving across two records forever, and neither
+        # could be told from the other; the church office adds each name once.
+        # Kept unique in the database rather than checked in the form, so two
+        # offices, or a retry after a dropped connection, cannot both win.
+        Index("uq_people_role_lower_name", "role", text("lower(name)"), unique=True),
     )
 
     id: Mapped[uuid.UUID] = uuid_pk()
@@ -188,6 +194,7 @@ class Transaction(Base, TimestampMixin):
         Index("ix_transactions_account", "account"),
         Index("ix_transactions_fund", "fund"),
         Index("ix_transactions_person_id", "person_id"),
+        Index("uq_transactions_client_request_id", "client_request_id", unique=True),
         _pct_deduction_index(),
     )
 
@@ -218,6 +225,12 @@ class Transaction(Base, TimestampMixin):
     person_id: Mapped[uuid.UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("people.id", ondelete="SET NULL"), nullable=True
     )
+    #: Sent by the form that wrote this entry, so a double-click or a retry after a
+    #: dropped connection is recognised as the same entry and returns the row that
+    #: already exists instead of writing a second one. Null for entries written by
+    #: anything that is not a form - transfers, deductions, older rows - and a
+    #: unique index allows any number of nulls, so those are unaffected.
+    client_request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_by_id: Mapped[uuid.UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

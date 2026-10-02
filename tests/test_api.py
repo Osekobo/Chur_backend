@@ -6,6 +6,7 @@ import uuid
 from collections.abc import Callable
 from datetime import date
 from decimal import Decimal
+from typing import ClassVar
 
 from app.enums import TITHE_SCOPE_ALL, TRANSFER_CATEGORY, Account
 from app.schemas.transaction import PctDeductionCreate
@@ -780,6 +781,160 @@ class TestPeople:
         )
 
 
+class TestNoDuplicates:
+    """One person once, and one collection once.
+
+    The guarantee is the database's, but it is tested through the API because that
+    is where a secretary meets it: the point is that she is told *who* is already
+    there, not that some index exists.
+    """
+
+    #: A person to try to add twice.
+    GIVER: ClassVar[dict[str, str]] = {
+        "role": "Member",
+        "name": "Angela Ochieng",
+        "category": "Youth",
+    }
+
+    def test_the_same_name_cannot_be_added_twice_in_a_role(
+        self, secretary_client: IdentityClient, clean_db: None
+    ) -> None:
+        first = secretary_client.post(f"{API}/people", json=self.GIVER)
+        assert first.status_code == 201, first.text
+
+        # Spelling and spacing are normalised on the way in, so these are the same
+        # person however they are typed.
+        again = secretary_client.post(
+            f"{API}/people", json={**self.GIVER, "name": "  angela   ochieng "}
+        )
+        assert again.status_code == 409
+        assert "already in the directory" in again.json()["detail"]
+        assert "Angela Ochieng" in again.json()["detail"]
+
+        assert len(secretary_client.get(f"{API}/people").json()) == 1
+
+    def test_the_same_name_may_exist_in_another_role(
+        self, secretary_client: IdentityClient, clean_db: None
+    ) -> None:
+        """A guest who later joins as a member is one person, two records."""
+        assert secretary_client.post(f"{API}/people", json=self.GIVER).status_code == 201
+        as_guest = secretary_client.post(
+            f"{API}/people", json={"role": "Guest", "name": "Angela Ochieng"}
+        )
+        assert as_guest.status_code == 201, as_guest.text
+
+    def test_renaming_onto_a_taken_name_is_refused(
+        self, secretary_client: IdentityClient, clean_db: None
+    ) -> None:
+        angela = secretary_client.post(f"{API}/people", json=self.GIVER).json()
+        beryl = secretary_client.post(
+            f"{API}/people", json={"role": "Member", "name": "Beryl Achieng"}
+        ).json()
+
+        clash = secretary_client.patch(
+            f"{API}/people/{beryl['id']}", json={"name": "angela ochieng"}
+        )
+        assert clash.status_code == 409
+        assert angela["id"] in [
+            p["id"] for p in secretary_client.get(f"{API}/people").json()
+        ]
+
+    def test_a_person_who_only_changes_phone_is_not_a_clash(
+        self, secretary_client: IdentityClient, clean_db: None
+    ) -> None:
+        """Patching somebody without touching their name must not trip the check."""
+        angela = secretary_client.post(f"{API}/people", json=self.GIVER).json()
+        same = secretary_client.patch(
+            f"{API}/people/{angela['id']}", json={"phone": "+254700000123"}
+        )
+        assert same.status_code == 200, same.text
+        assert same.json()["phone"] == "+254700000123"
+
+    def test_the_same_collection_cannot_be_saved_twice(
+        self, secretary_client: IdentityClient, member: dict[str, str]
+    ) -> None:
+        entry = {
+            "type": "income",
+            "category": "Tithes",
+            "person_id": member["id"],
+            "amount": "4500.00",
+            "fund": "General Fund",
+            "account": "Cash",
+            "date": date.today().isoformat(),
+        }
+        assert secretary_client.post(f"{API}/transactions", json=entry).status_code == 201
+
+        again = secretary_client.post(f"{API}/transactions", json=entry)
+        assert again.status_code == 409
+        assert "already has a Tithes entry" in again.json()["detail"]
+
+        listed = secretary_client.get(f"{API}/transactions").json()
+        assert len([r for r in listed if r["type"] == "income"]) == 1
+
+    def test_a_second_different_collection_is_allowed(
+        self, secretary_client: IdentityClient, member: dict[str, str]
+    ) -> None:
+        """Two tithes of the same amount are not the same tithe."""
+        entry = {
+            "type": "income",
+            "category": "Tithes",
+            "person_id": member["id"],
+            "amount": "4500.00",
+            "fund": "General Fund",
+            "account": "Cash",
+            "date": date.today().isoformat(),
+        }
+        assert secretary_client.post(f"{API}/transactions", json=entry).status_code == 201
+
+        # A different day, and a different fund, are both ordinary.
+        other_day = secretary_client.post(
+            f"{API}/transactions", json={**entry, "date": "2026-01-01"}
+        )
+        other_fund = secretary_client.post(
+            f"{API}/transactions", json={**entry, "fund": "Building"}
+        )
+        assert other_day.status_code == 201, other_day.text
+        assert other_fund.status_code == 201, other_fund.text
+
+    def test_a_doubled_click_returns_the_entry_it_already_wrote(
+        self, secretary_client: IdentityClient, member: dict[str, str]
+    ) -> None:
+        """The form's own token makes a repeat a replay, not a second row."""
+        entry = {
+            "type": "income",
+            "category": "Offerings",
+            "person_id": member["id"],
+            "amount": "500.00",
+            "fund": "General Fund",
+            "account": "Cash",
+            "date": date.today().isoformat(),
+            "client_request_id": "form-abc-123",
+        }
+        first = secretary_client.post(f"{API}/transactions", json=entry)
+        assert first.status_code == 201, first.text
+
+        replay = secretary_client.post(f"{API}/transactions", json=entry)
+        assert replay.status_code == 201
+        assert replay.json()["id"] == first.json()["id"]
+        assert len(secretary_client.get(f"{API}/transactions").json()) == 1
+
+    def test_two_expenses_may_match_exactly(
+        self, admin_client: TestClient, member: dict[str, str]
+    ) -> None:
+        """The rule is about one gift recorded twice, not about equal sums."""
+        entry = {
+            "type": "expense",
+            "category": "Suppliers",
+            "party": "Kenya Power",
+            "amount": "1200.00",
+            "fund": "General Fund",
+            "account": "Bank",
+            "date": date.today().isoformat(),
+        }
+        assert admin_client.post(f"{API}/transactions", json=entry).status_code == 201
+        assert admin_client.post(f"{API}/transactions", json=entry).status_code == 201
+
+
 class TestReporting:
     def test_dashboard_totals_reflect_recorded_entries(
         self, auth_client: TestClient, member: dict[str, str]
@@ -1105,7 +1260,7 @@ class TestPercentageDeduction:
             json={
                 "type": "income",
                 "category": category,
-                "person_id": insert_person("Mary Achieng")["id"],
+                "person_id": insert_person("Njeri Achieng")["id"],
                 "amount": amount,
                 "account": "Bank",
                 "date": self.SUNDAY,

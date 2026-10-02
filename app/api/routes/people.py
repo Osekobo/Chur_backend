@@ -39,6 +39,32 @@ PeopleManager = Annotated[User, Depends(require_permission(Permission.PEOPLE_MAN
 _SNAPSHOT_FIELDS = ("name", "phone", "email", "role")
 
 
+async def _refuse_duplicate_name(
+    db: DbSession, role: PersonRole, name: str, *, excluding: uuid.UUID | None = None
+) -> None:
+    """Refuse a name already used in that role, with an answer rather than a code.
+
+    ``people`` carries a unique index on (role, lower(name)) so the database is the
+    real guarantee - two offices saving the same person at once cannot both win.
+    This check runs first only so the person adding Angela hears "Angela is already
+    in the directory" instead of a generic conflict, and can go and use her.
+    """
+    statement = select(Person.name).where(
+        Person.role == role, func.lower(Person.name) == name.strip().lower()
+    )
+    if excluding is not None:
+        statement = statement.where(Person.id != excluding)
+    taken = await db.scalar(statement.limit(1))
+    if taken is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{taken} is already in the directory as a {role.value}. Use that"
+                " entry, or pick a different name."
+            ),
+        )
+
+
 @router.get("", response_model=list[PersonRead], summary="List people")
 async def list_people(
     db: DbSession,
@@ -82,6 +108,7 @@ async def count_people(db: DbSession, _user: PeopleViewer) -> dict[str, int]:
 async def create_person(
     payload: PersonCreate, db: DbSession, user: PeopleManager, ip: ClientIp
 ) -> PersonRead:
+    await _refuse_duplicate_name(db, payload.role, payload.name)
     person = Person(**payload.model_dump())
     db.add(person)
     await audit.record(
@@ -96,9 +123,16 @@ async def create_person(
     )
     try:
         await db.commit()
-    except IntegrityError as exc:  # pragma: no cover - defensive
+    except IntegrityError as exc:
+        # Two people saved from two places between the check above and this commit.
         await db.rollback()
-        raise HTTPException(status_code=409, detail="Could not save this person.") from exc
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{payload.name.strip()} is already in the directory as a"
+                f" {payload.role.value}. Use that entry, or pick a different name."
+            ),
+        ) from exc
     await db.refresh(person)
     return PersonRead.model_validate(person)
 
@@ -128,6 +162,16 @@ async def update_person(
         PersonBase.model_validate(merged)
     except ValidationError as exc:
         raise RequestValidationError(exc.errors()) from exc
+
+    # Renaming someone onto a name their role already uses would collide with the
+    # unique index; the check below turns that into an answer. Re-checking on a
+    # patch that touches neither name nor role costs one indexed lookup.
+    await _refuse_duplicate_name(
+        db,
+        PersonRole(merged["role"]),
+        str(merged["name"]),
+        excluding=person.id,
+    )
 
     for field, value in requested.items():
         setattr(person, field, value)

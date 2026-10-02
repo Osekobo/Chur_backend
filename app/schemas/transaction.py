@@ -39,6 +39,8 @@ class TransactionBase(BaseModel):
     #: Who the money came from. Required for money in, refused for money out:
     #: a giver is someone in the directory, not a name typed into a box.
     person_id: uuid.UUID | None = None
+    #: The form's own token for this entry, so a double-click cannot write it twice.
+    client_request_id: str | None = Field(default=None, max_length=64)
 
     @field_validator("amount")
     @classmethod
@@ -114,6 +116,7 @@ class TransactionRead(ORMModel):
     pct: MONEY | None = None
     base_total: MONEY | None = None
     person_id: uuid.UUID | None = None
+    client_request_id: str | None = None
     created_by_id: uuid.UUID | None = None
     created_at: datetime
     updated_at: datetime

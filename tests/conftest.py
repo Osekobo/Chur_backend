@@ -31,7 +31,7 @@ from app.db import models  # noqa: F401  (registers the tables)
 from app.db.base import Base
 from fastapi.testclient import TestClient
 from httpx import Headers
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import Session
 
 TEST_USER = {
@@ -235,6 +235,11 @@ def insert_person(name: str, role: str = "Member", **fields: str) -> dict[str, s
     A plain function rather than a fixture, so the helpers inside a test module can
     call it mid-test; every caller runs after ``clean_db`` has already truncated, so
     the row is never wiped by the next test's setup.
+
+    Hands back the row already there if that name is in the directory in that role:
+    ``people`` is unique on (role, lower(name)), and a shared helper called twice
+    from two tests means one person, not two. Tests about duplicate refusal go
+    through the API instead, where the check under test actually lives.
     """
     from app.db.models import Person
     from app.enums import PersonRole
@@ -242,6 +247,13 @@ def insert_person(name: str, role: str = "Member", **fields: str) -> dict[str, s
     engine = create_engine(settings.sync_database_url, future=True)
     try:
         with Session(engine) as session:
+            existing = session.scalar(
+                select(Person).where(
+                    Person.role == PersonRole(role), func.lower(Person.name) == name.lower()
+                )
+            )
+            if existing is not None:
+                return {"id": str(existing.id), "name": existing.name, "role": role}
             person = Person(name=name, role=PersonRole(role), **fields)
             session.add(person)
             session.commit()

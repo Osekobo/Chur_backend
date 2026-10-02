@@ -62,6 +62,28 @@ def _money(value: object) -> Decimal:
     return Decimal(str(value or 0)).quantize(_CENTS)
 
 
+async def _matching_collection(
+    db: DbSession, payload: TransactionCreate
+) -> Transaction | None:
+    """The earlier income entry this one would duplicate, if there is one.
+
+    Same giver, category, sum, account, fund and date. Notes are left out on
+    purpose: writing the same gift down twice with different notes is still the
+    same money twice. A transfer cannot match, because its income leg names no
+    giver and so has nothing to compare.
+    """
+    statement = select(Transaction).where(
+        Transaction.type == TransactionType.INCOME,
+        Transaction.person_id == payload.person_id,
+        Transaction.category == payload.category,
+        Transaction.amount == payload.amount,
+        Transaction.account == payload.account,
+        Transaction.fund == payload.fund,
+        Transaction.date == payload.date,
+    )
+    return await db.scalar(statement.limit(1))
+
+
 @router.get(
     "/accounts/balances", response_model=list[NamedTotal], summary="Balance per payment account"
 )
@@ -283,6 +305,12 @@ async def create_transaction(
     for the payload: a secretary may raise income but not spending. Refusing here,
     after the direction is known, is the only way to express that without two
     near-duplicate endpoints that would drift apart.
+
+    Two guards keep one collection from being written twice. The form's own token
+    makes a double-click or a retry return the entry that already exists, and a
+    second check refuses the same person giving the same amount for the same
+    category into the same account on the same day - which is nearly always one
+    entry saved twice rather than two gifts.
     """
     ensure_permission(
         user,
@@ -290,9 +318,16 @@ async def create_transaction(
         if payload.type is TransactionType.INCOME
         else Permission.MONEY_OUT,
     )
-    # The giver's name is copied from the directory row rather than accepted from
-    # the client, so the two cannot disagree - and so a name in the ledger is
-    # always a name that existed in the directory when it was written.
+    if payload.client_request_id:
+        replay = await db.scalar(
+            select(Transaction).where(Transaction.client_request_id == payload.client_request_id)
+        )
+        if replay is not None:
+            # Already written. Saying so quietly is the point of the token: the
+            # second click gets the row, not a second row, and the audit trail
+            # keeps one entry for one sum of money.
+            return TransactionRead.model_validate(replay)
+
     values = payload.model_dump()
     if payload.type is TransactionType.INCOME:
         person = await db.get(Person, payload.person_id)
@@ -300,6 +335,17 @@ async def create_transaction(
             raise HTTPException(
                 status_code=404,
                 detail="That person is not in the directory any more. Pick another.",
+            )
+        duplicate = await _matching_collection(db, payload)
+        if duplicate is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{person.name} already has a {payload.category} entry of"
+                    f" {payload.amount} for {payload.date} in {payload.account}."
+                    " If that is this collection recorded twice, delete the earlier entry;"
+                    " if it really is a second, separate one, change the amount or the fund."
+                ),
             )
         values["party"] = person.name
     else:
